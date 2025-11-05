@@ -26,19 +26,21 @@ Notes TUI is a fast, keyboard-first note-taking application for the terminal. It
 
 ## TUI shortcuts
 
-- `a` — open quick-create modal (type a title, press Enter to save).
-- `/` — start search; Esc cancels.
-- `Shift+R` — toggle regex mode for the current search.
-- `p` — toggle pin; `Shift+A` — toggle archive.
-- `t` — open tag editor (space toggles, `a` adds, Enter saves).
-- `r` — rename selected note (active view).
-- `e` — enter edit mode for the focused note (Esc exits, `Ctrl-s` saves immediately).
-- `d` — move selected note to trash (with confirmation).
-- `T` — toggle trash view; inside trash use `u` to restore, `Shift+U` to restore all, and `Shift+P` to purge all trashed notes.
-- `Ctrl-r` — refresh from storage.
-- `Ctrl-z` / `Ctrl-y` — undo / redo while editing.
-- `Ctrl-←` / `Ctrl-→` — jump by words while editing.
-- `Shift+W` — toggle word wrap for the preview/editor pane.
+- `q` / `Ctrl-c` — quit (unsaved edits prompt before exit).
+- `j` / `k` or `↓` / `↑` — move the selection; `Tab` toggles focus between list and reader.
+- `a` — open the quick-create modal (type a title, press Enter to save, Esc cancels).
+- `/` — start search input (Esc clears, Enter keeps the filter active); `Shift+R` toggles regex mode.
+- `p` toggles pin, `Shift+A` toggles archive, `d` moves the selected note to trash (with confirmation).
+- `T` toggles trash view; within trash use `u` to restore a note, `Shift+U` to restore all, and `Shift+P` to purge all trashed notes.
+- `r` renames the selected note; `Ctrl-r` refreshes from storage.
+- `e` enters edit mode (Esc exits, `Ctrl-s` saves immediately, `Shift+W` toggles wrap, `Ctrl-z` / `Ctrl-y` undo/redo, `Ctrl-←` / `Ctrl-→` jump by words).
+- `t` opens the tag editor overlay:
+  - `Space` toggles the highlighted tag for the current note.
+  - `a` adds a new tag, `r` starts rename, `m` merges into another tag, `x` queues delete.
+  - While renaming/merging, type to edit the input; Enter commits, Esc cancels.
+  - When deleting, press `y` / Enter to confirm or `n` / Esc to back out.
+  - `j` / `k` (or arrows) move the cursor, `PgUp` / `PgDn` jump five rows, Enter applies changes, Esc closes without saving.
+  - After saving, the overlay stays open so you can continue editing or press Esc to return.
 
 Autosave is enabled by default with crash recovery snapshots written under `~/.local/state/notetui/autosave/`. The status bar shows when a save is pending, complete, or has encountered an error. If the app detects leftover autosave drafts on launch, it opens a recovery dialog where you can restore (`Enter`) or discard (`d` / `D`) each snapshot.
 
