@@ -7,13 +7,15 @@ use time::{macros::format_description, OffsetDateTime};
 
 use regex::{Regex, RegexBuilder};
 
-use crate::app::state::{AppState, FocusPane, OverlayState, TagEditorMode};
+use crate::app::state::{
+    AppState, BulkTrashAction, FocusPane, OverlayState, TagEditorMode, TagInputKind,
+};
 use crate::journaling::AutoSaveStatus;
 
 pub fn draw_app(frame: &mut Frame, state: &AppState, list_state: &mut ListState) {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(2)])
+        .constraints([Constraint::Min(3), Constraint::Length(4)])
         .split(frame.size());
 
     let columns = Layout::default()
@@ -73,10 +75,39 @@ pub fn draw_app(frame: &mut Frame, state: &AppState, list_state: &mut ListState)
             Style::default().add_modifier(Modifier::BOLD),
         ));
         let title_line = Line::from(title_spans);
-        let meta_line = Line::from(Span::styled(
-            format!("Updated {}", note.updated_at),
-            Style::default().fg(Color::Gray),
-        ));
+        let meta_line = if state.show_trash {
+            let mut spans = Vec::new();
+            let deleted_style = Style::default().fg(Color::Gray);
+            let deleted_label = note
+                .deleted_label
+                .as_deref()
+                .map(|label| format!("Deleted {}", label))
+                .unwrap_or_else(|| "Deleted — unknown time".to_string());
+            spans.push(Span::styled(deleted_label, deleted_style));
+            if let Some(status) = &note.trash_status {
+                spans.push(Span::raw(" • "));
+                let status_style = if status.expired {
+                    Style::default()
+                        .fg(Color::Red)
+                        .add_modifier(Modifier::BOLD | Modifier::ITALIC)
+                } else if status.indefinite {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::ITALIC)
+                } else {
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::ITALIC)
+                };
+                spans.push(Span::styled(status.label.clone(), status_style));
+            }
+            Line::from(spans)
+        } else {
+            Line::from(Span::styled(
+                format!("Updated {}", note.updated_at),
+                Style::default().fg(Color::Gray),
+            ))
+        };
         let mut preview_lines = Vec::new();
         for line in note.preview.lines() {
             preview_lines.push(Line::from(highlight_line(
@@ -101,13 +132,18 @@ pub fn draw_app(frame: &mut Frame, state: &AppState, list_state: &mut ListState)
         items.push(ListItem::new(lines));
     }
     if items.is_empty() {
-        items.push(ListItem::new("No notes yet. Press `a` to create one."));
+        if state.show_trash {
+            items.push(ListItem::new("Trash is empty."));
+        } else {
+            items.push(ListItem::new("No notes yet. Press `a` to create one."));
+        }
     }
 
+    let list_title = if state.show_trash { "Trash" } else { "Notes" };
     let list = List::new(items)
         .block(
             Block::default()
-                .title("Notes")
+                .title(list_title)
                 .borders(Borders::ALL)
                 .border_style(list_block_style),
         )
@@ -243,6 +279,35 @@ fn build_status_line(state: &AppState) -> Text<'static> {
                 .fg(Color::Red)
                 .add_modifier(Modifier::BOLD | Modifier::ITALIC),
         ));
+        if let Some(note) = state.selected() {
+            spans.push(Span::raw(" | Purge: "));
+            let style = note.trash_status.as_ref().map(|status| {
+                if status.expired {
+                    Style::default()
+                        .fg(Color::Red)
+                        .add_modifier(Modifier::BOLD | Modifier::ITALIC)
+                } else if status.indefinite {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::ITALIC)
+                } else {
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::ITALIC)
+                }
+            });
+            if let Some(label_style) = style {
+                spans.push(Span::styled(
+                    note.trash_status
+                        .as_ref()
+                        .map(|status| status.label.clone())
+                        .unwrap_or_else(|| "n/a".into()),
+                    label_style,
+                ));
+            } else {
+                spans.push(Span::styled("n/a", Style::default().fg(Color::Gray)));
+            }
+        }
     }
 
     let tokens = state.search_tokens();
@@ -371,18 +436,32 @@ fn build_status_line(state: &AppState) -> Text<'static> {
     let mut lines = Vec::with_capacity(2);
     lines.push(Line::from(spans));
 
-    let mut keys_line = Vec::new();
-    keys_line.push(Span::styled(
+    let mut keys_line1 = Vec::new();
+    keys_line1.push(Span::styled(
         "Keys: ",
         Style::default()
             .fg(Color::Gray)
             .add_modifier(Modifier::BOLD),
     ));
-    keys_line.push(Span::styled(
-        "j/k move • Tab focus • / search • Shift+R regex • a add • p pin • A archive • e edit • Ctrl-s save • Ctrl-z undo • Ctrl-y redo • Ctrl-←/→ word jump • Shift+W wrap • d delete • T trash view • q quit",
+    keys_line1.push(Span::styled(
+        "j/k move • Tab focus • / search • Shift+R regex • a add • p pin • A archive",
         Style::default().fg(Color::DarkGray),
     ));
-    lines.push(Line::from(keys_line));
+    lines.push(Line::from(keys_line1));
+
+    let mut keys_line2 = Vec::new();
+    keys_line2.push(Span::styled(
+        "      e edit • Ctrl-s save • Ctrl-z undo • Ctrl-y redo • Ctrl-←/→ word jump",
+        Style::default().fg(Color::DarkGray),
+    ));
+    lines.push(Line::from(keys_line2));
+
+    let mut keys_line3 = Vec::new();
+    keys_line3.push(Span::styled(
+        "      Shift+W wrap • d delete • T trash view • q quit",
+        Style::default().fg(Color::DarkGray),
+    ));
+    lines.push(Line::from(keys_line3));
 
     Text::from(lines)
 }
@@ -566,6 +645,50 @@ fn render_overlay(frame: &mut Frame, state: &AppState) {
             .wrap(Wrap { trim: false });
             frame.render_widget(paragraph, area);
         }
+        Some(OverlayState::BulkTrash(dialog)) => {
+            let (title, body_lines, accent) = match dialog.action {
+                BulkTrashAction::RestoreAll => (
+                    "Restore All Notes",
+                    vec![
+                        Line::from(Span::styled(
+                            "Restore every note from the trash?",
+                            Style::default().add_modifier(Modifier::BOLD),
+                        )),
+                        Line::from(""),
+                        Line::from("Enter or y restore • Esc cancel"),
+                    ],
+                    Color::Green,
+                ),
+                BulkTrashAction::PurgeAll => (
+                    "Purge Trash",
+                    vec![
+                        Line::from(Span::styled(
+                            "Permanently delete every trashed note?",
+                            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                        )),
+                        Line::from(Span::styled(
+                            "This cannot be undone.",
+                            Style::default().fg(Color::Red),
+                        )),
+                        Line::from(""),
+                        Line::from(Span::styled(
+                            "Enter or y purge • Esc cancel",
+                            Style::default().fg(Color::Red),
+                        )),
+                    ],
+                    Color::Red,
+                ),
+            };
+            let area = centered_rect(50, 30, frame.size());
+            frame.render_widget(Clear, area);
+            let paragraph = Paragraph::new(body_lines).block(
+                Block::default()
+                    .title(title)
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(accent)),
+            );
+            frame.render_widget(paragraph, area);
+        }
         Some(OverlayState::TagEditor(editor)) => {
             let area = centered_rect(60, 65, frame.size());
             frame.render_widget(Clear, area);
@@ -583,9 +706,20 @@ fn render_overlay(frame: &mut Frame, state: &AppState) {
                 )
                 .split(area);
 
-            let instructions = match editor.mode {
-                TagEditorMode::Browse => "Space toggles • a add tag • Enter save • Esc cancel",
-                TagEditorMode::Adding => "Type tag name • Enter confirm • Esc cancel",
+            let instructions = match &editor.mode {
+                TagEditorMode::Browse => {
+                    "Space toggle • a add • r rename • m merge • x delete • Enter save • Esc close"
+                }
+                TagEditorMode::Input(TagInputKind::Add) => {
+                    "Type tag name • Enter confirm • Esc cancel"
+                }
+                TagEditorMode::Input(TagInputKind::Rename { .. }) => {
+                    "Rename tag • Enter apply • Esc cancel"
+                }
+                TagEditorMode::Input(TagInputKind::Merge { .. }) => {
+                    "Merge into existing tag • Enter merge • Esc cancel"
+                }
+                TagEditorMode::ConfirmDelete { .. } => "Delete tag • y confirm • n / Esc cancel",
             };
 
             let header = Paragraph::new(vec![
@@ -639,8 +773,8 @@ fn render_overlay(frame: &mut Frame, state: &AppState) {
                 .highlight_symbol("▸ ");
             frame.render_stateful_widget(list, layout[1], &mut list_state);
 
-            let input_para = match editor.mode {
-                TagEditorMode::Adding => {
+            let input_para = match &editor.mode {
+                TagEditorMode::Input(TagInputKind::Add) => {
                     let mut display = editor.input.clone();
                     display.push('▌');
                     Paragraph::new(vec![
@@ -651,6 +785,35 @@ fn render_overlay(frame: &mut Frame, state: &AppState) {
                         Line::from(display),
                     ])
                 }
+                TagEditorMode::Input(TagInputKind::Rename { original }) => {
+                    let mut display = editor.input.clone();
+                    display.push('▌');
+                    Paragraph::new(vec![
+                        Line::from(Span::styled(
+                            format!("Renaming '{}'", original),
+                            Style::default().fg(Color::Cyan),
+                        )),
+                        Line::from(display),
+                    ])
+                }
+                TagEditorMode::Input(TagInputKind::Merge { source }) => {
+                    let mut display = editor.input.clone();
+                    display.push('▌');
+                    Paragraph::new(vec![
+                        Line::from(Span::styled(
+                            format!("Merge '{}' into tag:", source),
+                            Style::default().fg(Color::Cyan),
+                        )),
+                        Line::from(display),
+                    ])
+                }
+                TagEditorMode::ConfirmDelete { tag } => Paragraph::new(vec![
+                    Line::from(Span::styled(
+                        format!("Delete tag '{}'", tag),
+                        Style::default().fg(Color::Red),
+                    )),
+                    Line::from("Press y to confirm or n / Esc to cancel"),
+                ]),
                 TagEditorMode::Browse => Paragraph::new(vec![
                     Line::from(Span::styled(
                         format!("Editing tags for note #{}", editor.note_id),
@@ -672,6 +835,78 @@ fn render_overlay(frame: &mut Frame, state: &AppState) {
                 .map(|msg| Span::styled(msg.clone(), Style::default().fg(Color::Yellow)))
                 .unwrap_or_else(|| Span::raw(" "));
             frame.render_widget(Paragraph::new(Line::from(status_line)), layout[3]);
+        }
+        Some(OverlayState::Recovery(overlay)) => {
+            let area = centered_rect(70, 60, frame.size());
+            frame.render_widget(Clear, area);
+
+            let mut lines = Vec::new();
+            lines.push(Line::from(Span::styled(
+                "Recovered Drafts",
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(Span::styled(
+                "Enter restore • d discard • D discard all • Esc close",
+                Style::default().fg(Color::Gray),
+            )));
+            lines.push(Line::from(""));
+
+            if overlay.entries.is_empty() {
+                lines.push(Line::from("No autosave drafts."));
+            } else {
+                for (idx, entry) in overlay.entries.iter().enumerate() {
+                    let marker = if idx == overlay.selected { "➤" } else { "  " };
+                    let mut spans = Vec::new();
+                    spans.push(Span::styled(
+                        marker,
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                    spans.push(Span::raw(" "));
+                    spans.push(Span::styled(
+                        format!("Note #{}", entry.note_id),
+                        if entry.missing {
+                            Style::default().fg(Color::Yellow)
+                        } else {
+                            Style::default().add_modifier(Modifier::BOLD)
+                        },
+                    ));
+                    spans.push(Span::raw("  "));
+                    spans.push(Span::styled(
+                        &entry.title,
+                        if entry.missing {
+                            Style::default().fg(Color::Yellow)
+                        } else {
+                            Style::default()
+                        },
+                    ));
+                    spans.push(Span::raw("  "));
+                    spans.push(Span::styled(
+                        &entry.saved_at,
+                        Style::default().fg(Color::Gray),
+                    ));
+                    lines.push(Line::from(spans));
+
+                    if let Some(preview) = entry.body.lines().next() {
+                        if !preview.trim().is_empty() {
+                            lines.push(Line::from(Span::styled(
+                                format!("   {}", preview.trim()),
+                                Style::default().fg(Color::DarkGray),
+                            )));
+                        }
+                    }
+                    lines.push(Line::from(""));
+                }
+            }
+
+            let paragraph = Paragraph::new(lines).block(
+                Block::default()
+                    .title("Autosave Recovery")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Magenta)),
+            );
+            frame.render_widget(paragraph, area);
         }
         None => {}
     }

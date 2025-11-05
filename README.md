@@ -34,13 +34,15 @@ Notes TUI is a fast, keyboard-first note-taking application for the terminal. It
 - `r` — rename selected note (active view).
 - `e` — enter edit mode for the focused note (Esc exits, `Ctrl-s` saves immediately).
 - `d` — move selected note to trash (with confirmation).
-- `T` — toggle trash view; inside trash use `u` to restore notes.
+- `T` — toggle trash view; inside trash use `u` to restore, `Shift+U` to restore all, and `Shift+P` to purge all trashed notes.
 - `Ctrl-r` — refresh from storage.
 - `Ctrl-z` / `Ctrl-y` — undo / redo while editing.
 - `Ctrl-←` / `Ctrl-→` — jump by words while editing.
 - `Shift+W` — toggle word wrap for the preview/editor pane.
 
-Autosave is enabled by default with crash recovery snapshots written under `~/.local/state/notetui/autosave/`. The status bar shows when a save is pending, complete, or has encountered an error.
+Autosave is enabled by default with crash recovery snapshots written under `~/.local/state/notetui/autosave/`. The status bar shows when a save is pending, complete, or has encountered an error. If the app detects leftover autosave drafts on launch, it opens a recovery dialog where you can restore (`Enter`) or discard (`d` / `D`) each snapshot.
+
+The trash view surfaces a countdown until each note is purged based on the `retention_days` setting in your config. Set `retention_days = 0` to disable automatic purging and rely solely on the bulk purge command.
 
 For deeper detail, see [`docs/architecture.md`](docs/architecture.md).
 

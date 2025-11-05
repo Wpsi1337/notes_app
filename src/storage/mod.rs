@@ -28,6 +28,26 @@ pub struct NoteRecord {
     pub pinned: bool,
     pub archived: bool,
     pub tags: Vec<String>,
+    pub deleted_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TagRenameOutcome {
+    Renamed {
+        from: String,
+        to: String,
+    },
+    Merged {
+        from: String,
+        to: String,
+        reassigned: usize,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagDeleteOutcome {
+    pub tag: String,
+    pub detached: usize,
 }
 
 #[derive(Clone)]
@@ -66,7 +86,8 @@ impl StorageHandle {
                         n.updated_at,
                         n.pinned,
                         n.archived,
-                        COALESCE(GROUP_CONCAT(t.name, '{delim}'), '')
+                        COALESCE(GROUP_CONCAT(t.name, '{delim}'), ''),
+                        n.deleted_at
                  FROM notes n
                  LEFT JOIN note_tags nt ON nt.note_id = n.id
                  LEFT JOIN tags t ON t.id = nt.tag_id
@@ -91,6 +112,7 @@ impl StorageHandle {
                         pinned: row.get::<_, i64>(5)? != 0,
                         archived: row.get::<_, i64>(6)? != 0,
                         tags: parse_tags(&tags),
+                        deleted_at: row.get::<_, Option<i64>>(8)?,
                     })
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -108,7 +130,8 @@ impl StorageHandle {
                         n.updated_at,
                         n.pinned,
                         n.archived,
-                        COALESCE(GROUP_CONCAT(t.name, '{delim}'), '')
+                        COALESCE(GROUP_CONCAT(t.name, '{delim}'), ''),
+                        n.deleted_at
                  FROM notes n
                  LEFT JOIN note_tags nt ON nt.note_id = n.id
                  LEFT JOIN tags t ON t.id = nt.tag_id
@@ -131,6 +154,7 @@ impl StorageHandle {
                         updated_at: row.get(4)?,
                         pinned: row.get::<_, i64>(5)? != 0,
                         archived: row.get::<_, i64>(6)? != 0,
+                        deleted_at: row.get::<_, Option<i64>>(8)?,
                         tags: parse_tags(&tags),
                     })
                 })?
@@ -178,16 +202,19 @@ impl StorageHandle {
                         n.updated_at,
                         n.pinned,
                         n.archived,
-                        COALESCE(GROUP_CONCAT(t.name, '{delim}'), '') AS tags,
+                        COALESCE((
+                            SELECT GROUP_CONCAT(t2.name, '{delim}')
+                            FROM note_tags nt2
+                            INNER JOIN tags t2 ON t2.id = nt2.tag_id
+                            WHERE nt2.note_id = n.id
+                        ), '') AS tags,
+                        n.deleted_at,
                         snippet(fts_notes, 1, '', '', ' ... ', 20) AS snippet
                  FROM fts_notes
                  INNER JOIN notes n ON n.id = fts_notes.rowid
-                 LEFT JOIN note_tags nt ON nt.note_id = n.id
-                 LEFT JOIN tags t ON t.id = nt.tag_id
                  WHERE n.deleted_at IS NULL
                    AND n.archived = 0
                    AND fts_notes MATCH ?1
-                 GROUP BY n.id
                  ORDER BY n.pinned DESC, bm25(fts_notes), n.updated_at DESC
                  LIMIT ?2",
                 delim = TAG_DELIMITER
@@ -197,7 +224,8 @@ impl StorageHandle {
                 params![match_expr, limit as i64],
                 |row| -> rusqlite::Result<NoteRecord> {
                     let tags: String = row.get(7)?;
-                    let snippet: String = row.get(8)?;
+                    let deleted_at = row.get::<_, Option<i64>>(8)?;
+                    let snippet: String = row.get(9)?;
                     let snippet = snippet.trim();
                     Ok(NoteRecord {
                         id: row.get(0)?,
@@ -213,6 +241,7 @@ impl StorageHandle {
                         pinned: row.get::<_, i64>(5)? != 0,
                         archived: row.get::<_, i64>(6)? != 0,
                         tags: parse_tags(&tags),
+                        deleted_at,
                     })
                 },
             )?;
@@ -315,6 +344,86 @@ impl StorageHandle {
         })
     }
 
+    pub fn rename_tag(&self, current: &str, new_name: &str) -> Result<TagRenameOutcome> {
+        let from = current.trim();
+        let to = new_name.trim();
+        if from.is_empty() || to.is_empty() {
+            bail!("tag names cannot be empty");
+        }
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let source_id: i64 = tx
+            .query_row(
+                "SELECT id FROM tags WHERE name = ?1",
+                params![from],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow::anyhow!("tag '{from}' not found"))?;
+
+        let existing: Option<i64> = tx
+            .query_row("SELECT id FROM tags WHERE name = ?1", params![to], |row| {
+                row.get(0)
+            })
+            .optional()?;
+
+        let outcome = match existing {
+            Some(target_id) if target_id != source_id => {
+                let reassigned = tx.execute(
+                    "INSERT OR IGNORE INTO note_tags (note_id, tag_id)
+                     SELECT note_id, ?1 FROM note_tags WHERE tag_id = ?2",
+                    params![target_id, source_id],
+                )?;
+                tx.execute(
+                    "DELETE FROM note_tags WHERE tag_id = ?1",
+                    params![source_id],
+                )?;
+                tx.execute("DELETE FROM tags WHERE id = ?1", params![source_id])?;
+                TagRenameOutcome::Merged {
+                    from: from.to_string(),
+                    to: to.to_string(),
+                    reassigned,
+                }
+            }
+            _ => {
+                tx.execute(
+                    "UPDATE tags SET name = ?1 WHERE id = ?2",
+                    params![to, source_id],
+                )?;
+                TagRenameOutcome::Renamed {
+                    from: from.to_string(),
+                    to: to.to_string(),
+                }
+            }
+        };
+
+        tx.commit()?;
+        Ok(outcome)
+    }
+
+    pub fn delete_tag(&self, name: &str) -> Result<TagDeleteOutcome> {
+        let tag = name.trim();
+        if tag.is_empty() {
+            bail!("tag name cannot be empty");
+        }
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let tag_id: i64 = tx
+            .query_row("SELECT id FROM tags WHERE name = ?1", params![tag], |row| {
+                row.get(0)
+            })
+            .optional()?
+            .ok_or_else(|| anyhow::anyhow!("tag '{tag}' not found"))?;
+
+        let detached = tx.execute("DELETE FROM note_tags WHERE tag_id = ?1", params![tag_id])?;
+        tx.execute("DELETE FROM tags WHERE id = ?1", params![tag_id])?;
+        tx.commit()?;
+        Ok(TagDeleteOutcome {
+            tag: tag.to_string(),
+            detached,
+        })
+    }
+
     pub fn rename_note_title(&self, note_id: i64, title: &str) -> Result<()> {
         let trimmed = title.trim();
         if trimmed.is_empty() {
@@ -332,6 +441,22 @@ impl StorageHandle {
         })
     }
 
+    pub fn tag_exists(&self, name: &str) -> Result<bool> {
+        let tag = name.trim();
+        if tag.is_empty() {
+            return Ok(false);
+        }
+        self.with_connection(|conn| {
+            let exists = conn
+                .query_row("SELECT 1 FROM tags WHERE name = ?1", params![tag], |_row| {
+                    Ok(())
+                })
+                .optional()?
+                .is_some();
+            Ok(exists)
+        })
+    }
+
     pub fn update_note_body(&self, note_id: i64, body: &str) -> Result<()> {
         self.with_connection(|conn| {
             let updated = conn.execute(
@@ -342,6 +467,79 @@ impl StorageHandle {
                 bail!("note {note_id} not found");
             }
             Ok(())
+        })
+    }
+
+    pub fn fetch_note_by_id(&self, note_id: i64) -> Result<Option<NoteRecord>> {
+        self.with_connection(|conn| {
+            let sql = format!(
+                "SELECT n.id,
+                        n.title,
+                        n.body,
+                        n.created_at,
+                        n.updated_at,
+                        n.pinned,
+                        n.archived,
+                        COALESCE(GROUP_CONCAT(t.name, '{delim}'), '') AS tags,
+                        n.deleted_at
+                 FROM notes n
+                 LEFT JOIN note_tags nt ON nt.note_id = n.id
+                 LEFT JOIN tags t ON t.id = nt.tag_id
+                 WHERE n.id = ?1 AND n.deleted_at IS NULL
+                 GROUP BY n.id",
+                delim = TAG_DELIMITER
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let result = stmt
+                .query_row(params![note_id], |row| {
+                    let tags: String = row.get(7)?;
+                    Ok(NoteRecord {
+                        id: row.get(0)?,
+                        title: row.get(1)?,
+                        body: row.get(2)?,
+                        snippet: None,
+                        created_at: row.get(3)?,
+                        updated_at: row.get(4)?,
+                        pinned: row.get::<_, i64>(5)? != 0,
+                        archived: row.get::<_, i64>(6)? != 0,
+                        tags: parse_tags(&tags),
+                        deleted_at: row.get::<_, Option<i64>>(8)?,
+                    })
+                })
+                .optional()?;
+            Ok(result)
+        })
+    }
+
+    pub fn restore_all_trash(&self) -> Result<usize> {
+        self.with_connection(|conn| {
+            let count = conn.execute(
+                "UPDATE notes SET deleted_at = NULL WHERE deleted_at IS NOT NULL",
+                [],
+            )?;
+            Ok(count)
+        })
+    }
+
+    pub fn purge_all_trash(&self) -> Result<usize> {
+        self.with_connection(|conn| {
+            let count = conn.execute("DELETE FROM notes WHERE deleted_at IS NOT NULL", [])?;
+            Ok(count)
+        })
+    }
+
+    pub fn purge_expired_trash(&self, retention_days: u32) -> Result<usize> {
+        if retention_days == 0 {
+            return Ok(0);
+        }
+        let threshold =
+            OffsetDateTime::now_utc().unix_timestamp() - i64::from(retention_days) * 86_400;
+        self.with_connection(|conn| {
+            let count = conn.execute(
+                "DELETE FROM notes WHERE deleted_at IS NOT NULL AND deleted_at <= ?1",
+                params![threshold],
+            )?;
+            Ok(count)
         })
     }
 
@@ -405,11 +603,22 @@ fn build_clause(column: Option<&str>, terms: &[String]) -> Option<String> {
             continue;
         }
         let escaped = trimmed.replace('"', "\"\"");
-        if let Some(col) = column {
-            parts.push(format!("{col}:\"{escaped}\"*"));
+        let has_whitespace = trimmed.chars().any(|ch| ch.is_whitespace());
+        let fragment = if has_whitespace {
+            if let Some(col) = column {
+                format!("{col}:\"{escaped}\"")
+            } else {
+                format!("\"{escaped}\"")
+            }
         } else {
-            parts.push(format!("\"{escaped}\"*"));
-        }
+            let token = escaped.replace(':', " ");
+            if let Some(col) = column {
+                format!("{col}:{token}*")
+            } else {
+                format!("{token}*")
+            }
+        };
+        parts.push(fragment);
     }
     if parts.is_empty() {
         None
@@ -426,6 +635,139 @@ fn parse_tags(raw: &str) -> Vec<String> {
         .filter(|tag| !tag.is_empty())
         .map(|tag| tag.to_string())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{ConfigPaths, StorageOptions};
+    use tempfile::TempDir;
+
+    fn temp_paths(root: &TempDir) -> ConfigPaths {
+        let base = root.path();
+        let config_dir = base.join("config");
+        let data_dir = base.join("data");
+        let cache_dir = base.join("cache");
+        let state_dir = base.join("state");
+        let log_dir = base.join("logs");
+        let backup_dir = base.join("backups");
+        ConfigPaths {
+            config_dir: config_dir.clone(),
+            config_file: config_dir.join("config.toml"),
+            data_dir: data_dir.clone(),
+            database_path: data_dir.join("notes.db"),
+            cache_dir,
+            backup_dir,
+            log_dir,
+            state_dir,
+        }
+    }
+
+    fn storage_options(paths: &ConfigPaths) -> StorageOptions {
+        let mut options = StorageOptions::default();
+        options.database_path = paths.database_path.clone();
+        options.backup_dir = paths.backup_dir.clone();
+        options
+    }
+
+    fn init_storage() -> anyhow::Result<(TempDir, StorageHandle)> {
+        let temp = TempDir::new()?;
+        let paths = temp_paths(&temp);
+        paths.ensure_directories()?;
+        let opts = storage_options(&paths);
+        let storage = init(&paths, &opts)?;
+        Ok((temp, storage))
+    }
+
+    #[test]
+    fn rename_tag_updates_all_references() -> anyhow::Result<()> {
+        let (_temp, storage) = init_storage()?;
+        let note_id = storage.create_note("Test", "body", false)?;
+        storage.add_tag_to_note(note_id, "alpha")?;
+
+        let outcome = storage.rename_tag("alpha", "beta")?;
+        assert!(matches!(
+            outcome,
+            TagRenameOutcome::Renamed { ref from, ref to }
+                if from == "alpha" && to == "beta"
+        ));
+
+        let summary = storage.fetch_recent_notes(5)?;
+        let tags = summary
+            .iter()
+            .find(|note| note.id == note_id)
+            .expect("note present")
+            .tags
+            .clone();
+        assert!(tags.contains(&"beta".to_string()));
+        assert!(!tags.iter().any(|tag| tag == "alpha"));
+        Ok(())
+    }
+
+    #[test]
+    fn rename_tag_merges_into_existing_tag() -> anyhow::Result<()> {
+        let (_temp, storage) = init_storage()?;
+        let alpha_note = storage.create_note("Alpha", "alpha body", false)?;
+        let beta_note = storage.create_note("Beta", "beta body", false)?;
+        storage.add_tag_to_note(alpha_note, "alpha")?;
+        storage.add_tag_to_note(beta_note, "beta")?;
+
+        let outcome = storage.rename_tag("alpha", "beta")?;
+        match outcome {
+            TagRenameOutcome::Merged {
+                from,
+                to,
+                reassigned,
+            } => {
+                assert_eq!(from, "alpha");
+                assert_eq!(to, "beta");
+                assert!(reassigned >= 1);
+            }
+            other => panic!("expected merged outcome, got {other:?}"),
+        }
+
+        let notes = storage.fetch_recent_notes(10)?;
+        for note in notes {
+            assert!(!note.tags.iter().any(|tag| tag == "alpha"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn delete_tag_unlinks_all_notes() -> anyhow::Result<()> {
+        let (_temp, storage) = init_storage()?;
+        let note = storage.create_note("Disposable", "body", false)?;
+        storage.add_tag_to_note(note, "alpha")?;
+
+        let outcome = storage.delete_tag("alpha")?;
+        assert_eq!(outcome.tag, "alpha");
+        assert_eq!(outcome.detached, 1);
+
+        let notes = storage.fetch_recent_notes(5)?;
+        let tags = notes
+            .iter()
+            .find(|summary| summary.id == note)
+            .expect("note present")
+            .tags
+            .clone();
+        assert!(!tags.iter().any(|tag| tag == "alpha"));
+        Ok(())
+    }
+
+    #[test]
+    fn purge_expired_trash_skips_when_retention_zero() -> anyhow::Result<()> {
+        let (_temp, storage) = init_storage()?;
+        let note_id = storage.create_note("Trash Test", "body", false)?;
+        storage.soft_delete_note(note_id)?;
+
+        let purged = storage.purge_expired_trash(0)?;
+        assert_eq!(purged, 0);
+
+        let trashed = storage.fetch_trashed_notes(10)?;
+        assert_eq!(trashed.len(), 1);
+        assert_eq!(trashed[0].id, note_id);
+        Ok(())
+    }
 }
 
 fn apply_filters(notes: &mut Vec<NoteRecord>, query: &SearchQuery) {

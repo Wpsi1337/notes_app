@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::journaling::AutoSaveStatus;
+use crate::journaling::{AutoSaveStatus, RecoverySnapshot};
 use crate::search::{parse_query, regex_pattern_from_input, RangeFilter, SearchQuery};
 use crate::storage::{NoteRecord, StorageHandle};
 
@@ -23,6 +23,16 @@ pub struct NoteSummary {
     pub pinned: bool,
     pub archived: bool,
     pub tags: Vec<String>,
+    pub deleted_at: Option<i64>,
+    pub deleted_label: Option<String>,
+    pub trash_status: Option<TrashStatus>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TrashStatus {
+    pub label: String,
+    pub expired: bool,
+    pub indefinite: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -61,10 +71,18 @@ pub struct TagEditorItem {
     pub original: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TagEditorMode {
     Browse,
-    Adding,
+    Input(TagInputKind),
+    ConfirmDelete { tag: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TagInputKind {
+    Add,
+    Rename { original: String },
+    Merge { source: String },
 }
 
 impl Default for TagEditorMode {
@@ -83,12 +101,40 @@ pub struct TagEditorOverlay {
     pub status: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BulkTrashAction {
+    RestoreAll,
+    PurgeAll,
+}
+
+#[derive(Debug, Clone)]
+pub struct BulkTrashOverlay {
+    pub action: BulkTrashAction,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecoveryEntry {
+    pub note_id: i64,
+    pub title: String,
+    pub saved_at: String,
+    pub body: String,
+    pub missing: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RecoveryOverlay {
+    pub entries: Vec<RecoveryEntry>,
+    pub selected: usize,
+}
+
 #[derive(Debug, Clone)]
 pub enum OverlayState {
     NewNote(NewNoteOverlay),
     RenameNote(RenameNoteOverlay),
     DeleteNote(DeleteNoteOverlay),
     TagEditor(TagEditorOverlay),
+    BulkTrash(BulkTrashOverlay),
+    Recovery(RecoveryOverlay),
 }
 
 #[derive(Debug, Clone)]
@@ -403,9 +449,10 @@ impl EditorState {
 pub struct AppState {
     pub focus: FocusPane,
     pub show_trash: bool,
-    pub notes: Vec<NoteSummary>,
     pub selected: usize,
     pub preview_lines: usize,
+    pub retention_days: u32,
+    pub notes: Vec<NoteSummary>,
     pub search: SearchState,
     pub status_message: Option<String>,
     pub overlay: Option<OverlayState>,
@@ -415,11 +462,15 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn load(storage: &StorageHandle, preview_lines: usize) -> Result<Self> {
+    pub fn load(
+        storage: &StorageHandle,
+        preview_lines: usize,
+        retention_days: u32,
+    ) -> Result<Self> {
         let records = storage.fetch_recent_notes(50)?;
         let notes = records
             .into_iter()
-            .map(|record| summarize_record(record, preview_lines))
+            .map(|record| summarize_record(record, preview_lines, retention_days))
             .collect::<Vec<_>>();
 
         Ok(Self {
@@ -427,6 +478,7 @@ impl AppState {
             show_trash: false,
             selected: 0,
             preview_lines,
+            retention_days,
             notes,
             search: SearchState::default(),
             status_message: None,
@@ -575,7 +627,7 @@ impl AppState {
         };
         self.notes = records
             .into_iter()
-            .map(|record| summarize_record(record, self.preview_lines))
+            .map(|record| summarize_record(record, self.preview_lines, self.retention_days))
             .collect();
         self.search.terms.clear();
         self.search.tags.clear();
@@ -720,7 +772,7 @@ impl AppState {
             Ok(records) => {
                 self.notes = records
                     .into_iter()
-                    .map(|record| summarize_record(record, self.preview_lines))
+                    .map(|record| summarize_record(record, self.preview_lines, self.retention_days))
                     .collect();
                 self.selected = 0;
                 self.normalize_selection();
@@ -841,6 +893,39 @@ impl AppState {
         Ok(())
     }
 
+    pub fn open_recovery_overlay(
+        &mut self,
+        storage: &StorageHandle,
+        snapshots: Vec<RecoverySnapshot>,
+    ) -> Result<()> {
+        if snapshots.is_empty() {
+            return Ok(());
+        }
+        let mut entries = Vec::with_capacity(snapshots.len());
+        for snapshot in snapshots {
+            let note_id = snapshot.note_id;
+            let saved_at = format_datetime(snapshot.saved_at);
+            let body = snapshot.body.clone();
+            let record = storage.fetch_note_by_id(note_id)?;
+            let (title, missing) = match record {
+                Some(note) => (note.title, false),
+                None => (format!("Recovered note #{} (missing)", note_id), true),
+            };
+            entries.push(RecoveryEntry {
+                note_id,
+                title,
+                saved_at,
+                body,
+                missing,
+            });
+        }
+        self.overlay = Some(OverlayState::Recovery(RecoveryOverlay {
+            entries,
+            selected: 0,
+        }));
+        Ok(())
+    }
+
     pub fn close_overlay(&mut self) {
         self.overlay = None;
     }
@@ -887,6 +972,28 @@ impl AppState {
         }
     }
 
+    pub fn open_bulk_trash_overlay(&mut self, action: BulkTrashAction) {
+        self.overlay = Some(OverlayState::BulkTrash(BulkTrashOverlay { action }));
+    }
+
+    pub fn bulk_trash_overlay(&self) -> Option<&BulkTrashOverlay> {
+        match self.overlay() {
+            Some(OverlayState::BulkTrash(ref overlay)) => Some(overlay),
+            _ => None,
+        }
+    }
+
+    pub fn bulk_trash_overlay_mut(&mut self) -> Option<&mut BulkTrashOverlay> {
+        match self.overlay_mut() {
+            Some(OverlayState::BulkTrash(ref mut overlay)) => Some(overlay),
+            _ => None,
+        }
+    }
+
+    pub fn bulk_trash_action(&self) -> Option<BulkTrashAction> {
+        self.bulk_trash_overlay().map(|overlay| overlay.action)
+    }
+
     pub fn tag_editor_overlay(&self) -> Option<&TagEditorOverlay> {
         match self.overlay() {
             Some(OverlayState::TagEditor(ref overlay)) => Some(overlay),
@@ -901,10 +1008,101 @@ impl AppState {
         }
     }
 
+    pub fn recovery_overlay(&self) -> Option<&RecoveryOverlay> {
+        match self.overlay() {
+            Some(OverlayState::Recovery(ref overlay)) => Some(overlay),
+            _ => None,
+        }
+    }
+
+    pub fn recovery_overlay_mut(&mut self) -> Option<&mut RecoveryOverlay> {
+        match self.overlay_mut() {
+            Some(OverlayState::Recovery(ref mut overlay)) => Some(overlay),
+            _ => None,
+        }
+    }
+
+    pub fn recovery_move_selection(&mut self, delta: isize) {
+        if let Some(overlay) = self.recovery_overlay_mut() {
+            if overlay.entries.is_empty() {
+                overlay.selected = 0;
+                return;
+            }
+            let len = overlay.entries.len() as isize;
+            let current = overlay.selected as isize;
+            let mut next = current + delta;
+            if next < 0 {
+                next = 0;
+            } else if next >= len {
+                next = len - 1;
+            }
+            overlay.selected = next as usize;
+        }
+    }
+
+    pub fn recovery_selected_entry(&self) -> Option<&RecoveryEntry> {
+        self.recovery_overlay()
+            .and_then(|overlay| overlay.entries.get(overlay.selected))
+    }
+
+    pub fn recovery_entries(&self) -> &[RecoveryEntry] {
+        self.recovery_overlay()
+            .map(|overlay| overlay.entries.as_slice())
+            .unwrap_or(&[])
+    }
+
+    pub fn recovery_remove_selected(&mut self) -> Option<RecoveryEntry> {
+        let mut should_clear = false;
+        let removed = match self.overlay_mut() {
+            Some(OverlayState::Recovery(ref mut overlay)) => {
+                if overlay.entries.is_empty() {
+                    return None;
+                }
+                let removed = overlay.entries.remove(overlay.selected);
+                if overlay.entries.is_empty() {
+                    should_clear = true;
+                } else if overlay.selected >= overlay.entries.len() {
+                    overlay.selected = overlay.entries.len() - 1;
+                }
+                removed
+            }
+            _ => return None,
+        };
+        if should_clear {
+            self.overlay = None;
+        }
+        Some(removed)
+    }
+
+    pub fn recovery_remove_for_note(&mut self, note_id: i64) {
+        let mut should_clear = false;
+        if let Some(OverlayState::Recovery(ref mut overlay)) = self.overlay_mut() {
+            let original_len = overlay.entries.len();
+            overlay.entries.retain(|entry| entry.note_id != note_id);
+            if overlay.entries.is_empty() && original_len > 0 {
+                should_clear = true;
+            } else if overlay.selected >= overlay.entries.len() && !overlay.entries.is_empty() {
+                overlay.selected = overlay.entries.len() - 1;
+            }
+        }
+        if should_clear {
+            self.overlay = None;
+        }
+    }
+
+    pub fn tag_editor_mode(&self) -> TagEditorMode {
+        self.tag_editor_overlay()
+            .map(|overlay| overlay.mode.clone())
+            .unwrap_or(TagEditorMode::Browse)
+    }
+
     pub fn tag_editor_move_selection(&mut self, delta: isize) {
         if let Some(editor) = self.tag_editor_overlay_mut() {
             if editor.items.is_empty() {
                 editor.selected_index = 0;
+                editor.status = None;
+                editor.input.clear();
+                editor.mode = TagEditorMode::Browse;
                 return;
             }
             let len = editor.items.len() as isize;
@@ -917,6 +1115,8 @@ impl AppState {
             }
             editor.selected_index = next as usize;
             editor.status = None;
+            editor.mode = TagEditorMode::Browse;
+            editor.input.clear();
         }
     }
 
@@ -926,20 +1126,66 @@ impl AppState {
                 item.selected = !item.selected;
             }
             editor.status = None;
+            editor.mode = TagEditorMode::Browse;
+            editor.input.clear();
         }
     }
 
     pub fn tag_editor_begin_add(&mut self) {
         if let Some(editor) = self.tag_editor_overlay_mut() {
-            editor.mode = TagEditorMode::Adding;
+            editor.mode = TagEditorMode::Input(TagInputKind::Add);
             editor.input.clear();
-            editor.status = None;
+            editor.status = Some("New tag: type name, Enter to add, Esc to cancel".into());
+        }
+    }
+
+    pub fn tag_editor_begin_rename(&mut self) {
+        if let Some(editor) = self.tag_editor_overlay_mut() {
+            if let Some(item) = editor.items.get(editor.selected_index) {
+                editor.mode = TagEditorMode::Input(TagInputKind::Rename {
+                    original: item.name.clone(),
+                });
+                editor.input = item.name.clone();
+                editor.status = Some(format!(
+                    "Renaming '{}': edit and press Enter, Esc to cancel",
+                    item.name
+                ));
+            }
+        }
+    }
+
+    pub fn tag_editor_begin_merge(&mut self) {
+        if let Some(editor) = self.tag_editor_overlay_mut() {
+            if let Some(item) = editor.items.get(editor.selected_index) {
+                editor.mode = TagEditorMode::Input(TagInputKind::Merge {
+                    source: item.name.clone(),
+                });
+                editor.input.clear();
+                editor.status = Some(format!(
+                    "Merge '{}' into existing tag: type target name",
+                    item.name
+                ));
+            }
+        }
+    }
+
+    pub fn tag_editor_begin_delete(&mut self) {
+        if let Some(editor) = self.tag_editor_overlay_mut() {
+            if let Some(item) = editor.items.get(editor.selected_index) {
+                editor.mode = TagEditorMode::ConfirmDelete {
+                    tag: item.name.clone(),
+                };
+                editor.status = Some(format!(
+                    "Delete '{}'? Press y to confirm or n / Esc to cancel",
+                    item.name
+                ));
+            }
         }
     }
 
     pub fn tag_editor_push_char(&mut self, ch: char) {
         if let Some(editor) = self.tag_editor_overlay_mut() {
-            if matches!(editor.mode, TagEditorMode::Adding) && editor.input.len() < 64 {
+            if matches!(editor.mode, TagEditorMode::Input(_)) && editor.input.len() < 64 {
                 editor.input.push(ch);
                 editor.status = None;
             }
@@ -948,7 +1194,7 @@ impl AppState {
 
     pub fn tag_editor_pop_char(&mut self) {
         if let Some(editor) = self.tag_editor_overlay_mut() {
-            if matches!(editor.mode, TagEditorMode::Adding) {
+            if matches!(editor.mode, TagEditorMode::Input(_)) {
                 editor.input.pop();
                 editor.status = None;
             }
@@ -957,7 +1203,7 @@ impl AppState {
 
     pub fn tag_editor_commit_input(&mut self) {
         if let Some(editor) = self.tag_editor_overlay_mut() {
-            if !matches!(editor.mode, TagEditorMode::Adding) {
+            if !matches!(editor.mode, TagEditorMode::Input(TagInputKind::Add)) {
                 return;
             }
             let name = editor.input.trim();
@@ -999,11 +1245,130 @@ impl AppState {
 
     pub fn tag_editor_cancel_input(&mut self) {
         if let Some(editor) = self.tag_editor_overlay_mut() {
-            if matches!(editor.mode, TagEditorMode::Adding) {
-                editor.mode = TagEditorMode::Browse;
-                editor.input.clear();
-                editor.status = None;
+            match editor.mode {
+                TagEditorMode::Input(_) | TagEditorMode::ConfirmDelete { .. } => {
+                    editor.mode = TagEditorMode::Browse;
+                    editor.input.clear();
+                    editor.status = None;
+                }
+                TagEditorMode::Browse => {}
             }
+        }
+    }
+
+    pub fn tag_editor_selected_name(&self) -> Option<String> {
+        self.tag_editor_overlay()
+            .and_then(|overlay| overlay.items.get(overlay.selected_index))
+            .map(|item| item.name.clone())
+    }
+
+    pub fn tag_editor_input_value(&self) -> Option<String> {
+        self.tag_editor_overlay()
+            .and_then(|overlay| match overlay.mode {
+                TagEditorMode::Input(_) => Some(overlay.input.trim().to_string()),
+                _ => None,
+            })
+    }
+
+    pub fn tag_editor_finish_rename(&mut self, from: &str, to: &str) {
+        if let Some(editor) = self.tag_editor_overlay_mut() {
+            for item in &mut editor.items {
+                if item.name == from {
+                    let was_selected = item.selected;
+                    let was_original = item.original;
+                    item.name = to.to_string();
+                    item.selected = was_selected;
+                    item.original = was_original;
+                    break;
+                }
+            }
+            editor
+                .items
+                .sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            if let Some(idx) = editor
+                .items
+                .iter()
+                .position(|item| item.name.eq_ignore_ascii_case(to))
+            {
+                editor.selected_index = idx;
+            }
+            editor.mode = TagEditorMode::Browse;
+            editor.input.clear();
+            editor.status = Some(format!("Renamed tag '{from}' → '{to}'"));
+        }
+    }
+
+    pub fn tag_editor_finish_merge(&mut self, from: &str, to: &str) {
+        if let Some(editor) = self.tag_editor_overlay_mut() {
+            let mut carried_selected = false;
+            let mut carried_original = false;
+            editor.items.retain(|item| {
+                if item.name == from {
+                    carried_selected = item.selected;
+                    carried_original = item.original;
+                    false
+                } else {
+                    true
+                }
+            });
+
+            if let Some(target) = editor
+                .items
+                .iter_mut()
+                .find(|item| item.name.eq_ignore_ascii_case(to))
+            {
+                if carried_selected {
+                    target.selected = true;
+                }
+                if carried_original {
+                    target.original = true;
+                }
+            } else {
+                editor.items.push(TagEditorItem {
+                    name: to.to_string(),
+                    selected: carried_selected,
+                    original: carried_original,
+                });
+            }
+
+            if editor.items.is_empty() {
+                editor.selected_index = 0;
+            } else {
+                editor
+                    .items
+                    .sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                editor.selected_index = editor
+                    .items
+                    .iter()
+                    .position(|item| item.name.eq_ignore_ascii_case(to))
+                    .unwrap_or(0);
+            }
+
+            editor.mode = TagEditorMode::Browse;
+            editor.input.clear();
+            editor.status = Some(format!("Merged '{from}' into '{to}'"));
+        }
+    }
+
+    pub fn tag_editor_finish_delete(&mut self, tag: &str) {
+        if let Some(editor) = self.tag_editor_overlay_mut() {
+            editor.items.retain(|item| item.name != tag);
+            if editor.selected_index >= editor.items.len() && !editor.items.is_empty() {
+                editor.selected_index = editor.items.len() - 1;
+            }
+            editor.mode = TagEditorMode::Browse;
+            editor.input.clear();
+            if editor.items.is_empty() {
+                editor.status = Some("No tags remain".into());
+            } else {
+                editor.status = Some(format!("Deleted tag '{tag}'"));
+            }
+        }
+    }
+
+    pub fn tag_editor_set_status<S: Into<String>>(&mut self, message: S) {
+        if let Some(editor) = self.tag_editor_overlay_mut() {
+            editor.status = Some(message.into());
         }
     }
 
@@ -1092,7 +1457,8 @@ fn position_for_column(text: &str, line_start: usize, column: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::EditorState;
+    use super::{compute_trash_status, EditorState};
+    use time::OffsetDateTime;
 
     #[test]
     fn editor_undo_redo_cycles() {
@@ -1126,9 +1492,42 @@ mod tests {
         assert!(!editor.is_dirty());
         assert!(!editor.undo());
     }
+
+    #[test]
+    fn trash_status_manual_purge_only_when_retention_zero() {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let status = compute_trash_status(Some(now), 0).expect("status");
+        assert_eq!(status.label, "Manual purge only");
+        assert!(!status.expired);
+        assert!(status.indefinite);
+    }
+
+    #[test]
+    fn trash_status_marks_expired_when_past_retention_window() {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let deleted_at = now - (86_400 * 2);
+        let status = compute_trash_status(Some(deleted_at), 1).expect("status");
+        assert!(status.expired);
+        assert!(status.label.contains("Expired"));
+        assert!(!status.indefinite);
+    }
+
+    #[test]
+    fn trash_status_reports_remaining_time() {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let deleted_at = now - (86_400 - 3_600); // about 1 hour remaining in a 1 day window
+        let status = compute_trash_status(Some(deleted_at), 1).expect("status");
+        assert!(!status.expired);
+        assert!(!status.indefinite);
+        assert!(
+            status.label.contains("left"),
+            "expected countdown label, got {}",
+            status.label
+        );
+    }
 }
 
-fn summarize_record(record: NoteRecord, preview_lines: usize) -> NoteSummary {
+fn summarize_record(record: NoteRecord, preview_lines: usize, retention_days: u32) -> NoteSummary {
     let NoteRecord {
         id,
         title,
@@ -1138,6 +1537,7 @@ fn summarize_record(record: NoteRecord, preview_lines: usize) -> NoteSummary {
         pinned,
         archived,
         tags,
+        deleted_at,
         ..
     } = record;
 
@@ -1163,7 +1563,57 @@ fn summarize_record(record: NoteRecord, preview_lines: usize) -> NoteSummary {
         pinned,
         archived,
         tags,
+        deleted_at,
+        deleted_label: deleted_at.map(format_timestamp),
+        trash_status: compute_trash_status(deleted_at, retention_days),
     }
+}
+
+fn compute_trash_status(deleted_at: Option<i64>, retention_days: u32) -> Option<TrashStatus> {
+    let deleted_at = deleted_at?;
+    if retention_days == 0 {
+        return Some(TrashStatus {
+            label: "Manual purge only".into(),
+            expired: false,
+            indefinite: true,
+        });
+    }
+
+    let purge_at = deleted_at + i64::from(retention_days) * 86_400;
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    let remaining = purge_at - now;
+    if remaining <= 0 {
+        return Some(TrashStatus {
+            label: "Expired — purge soon".into(),
+            expired: true,
+            indefinite: false,
+        });
+    }
+
+    let label = if remaining >= 86_400 * 2 {
+        let days = remaining / 86_400;
+        format!("{days}d left")
+    } else if remaining >= 86_400 {
+        let days = remaining / 86_400;
+        let hours = (remaining % 86_400 + 3_599) / 3_600;
+        if hours == 0 {
+            format!("{days}d left")
+        } else {
+            format!("{days}d {hours}h left")
+        }
+    } else if remaining >= 3_600 {
+        let hours = (remaining + 3_599) / 3_600;
+        format!("{hours}h left")
+    } else {
+        let minutes = (remaining + 59) / 60;
+        format!("{minutes}m left")
+    };
+
+    Some(TrashStatus {
+        label,
+        expired: false,
+        indefinite: false,
+    })
 }
 
 fn build_filter_chips(query: &SearchQuery) -> Vec<String> {
@@ -1192,6 +1642,11 @@ fn format_range_chip(label: &str, range: &RangeFilter) -> Option<String> {
         (None, Some(end)) => Some(format!("{label}:..{end}")),
         _ => None,
     }
+}
+
+fn format_datetime(dt: OffsetDateTime) -> String {
+    dt.format(&Rfc3339)
+        .unwrap_or_else(|_| dt.unix_timestamp().to_string())
 }
 
 fn format_timestamp(epoch: i64) -> String {

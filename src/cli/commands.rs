@@ -10,7 +10,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use crate::app::App;
 use crate::config::AppConfig;
 use crate::search::{parse_query, regex_pattern_from_input};
-use crate::storage::{NoteRecord, StorageHandle};
+use crate::storage::{NoteRecord, StorageHandle, TagRenameOutcome};
 
 #[derive(Args, Debug, Clone)]
 pub struct NewArgs {
@@ -46,6 +46,12 @@ pub enum TagCommand {
     Remove(TagRemoveArgs),
     /// List tags associated with a note
     List(TagListArgs),
+    /// Rename a tag across all notes
+    Rename(TagRenameArgs),
+    /// Merge one tag into another existing tag
+    Merge(TagMergeArgs),
+    /// Delete a tag from all notes
+    Delete(TagDeleteArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -68,6 +74,28 @@ pub struct TagRemoveArgs {
 pub struct TagListArgs {
     /// Note identifier
     pub note_id: i64,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct TagRenameArgs {
+    /// Existing tag name (will be renamed)
+    pub from: String,
+    /// New tag name
+    pub to: String,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct TagMergeArgs {
+    /// Source tag that will be merged
+    pub from: String,
+    /// Target tag that must already exist
+    pub into: String,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct TagDeleteArgs {
+    /// Tag name to delete
+    pub tag: String,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -181,6 +209,9 @@ pub fn handle_tag_command(
         TagCommand::Add(args) => tag_add(&storage, args),
         TagCommand::Remove(args) => tag_remove(&storage, args),
         TagCommand::List(args) => tag_list(&storage, args),
+        TagCommand::Rename(args) => tag_rename(&storage, args),
+        TagCommand::Merge(args) => tag_merge(&storage, args),
+        TagCommand::Delete(args) => tag_delete(&storage, args),
     }
 }
 
@@ -282,6 +313,105 @@ fn tag_list(storage: &StorageHandle, args: TagListArgs) -> Result<()> {
     if count == 0 {
         println!("(no tags)");
     }
+    Ok(())
+}
+
+fn tag_rename(storage: &StorageHandle, args: TagRenameArgs) -> Result<()> {
+    let from = args.from.trim();
+    if from.is_empty() {
+        bail!("source tag cannot be empty");
+    }
+    let mut to = args.to.trim().to_string();
+    if to.is_empty() {
+        bail!("destination tag cannot be empty");
+    }
+    if to.len() > 64 {
+        to.truncate(64);
+    }
+    if from.eq_ignore_ascii_case(&to) {
+        bail!("source and destination tags are the same");
+    }
+
+    let outcome = storage
+        .rename_tag(from, &to)
+        .with_context(|| format!("renaming tag '{from}' to '{to}'"))?;
+    match outcome {
+        TagRenameOutcome::Renamed { from, to } => {
+            println!("Renamed tag '{from}' to '{to}'");
+        }
+        TagRenameOutcome::Merged {
+            from,
+            to,
+            reassigned,
+        } => {
+            println!(
+                "Merged tag '{from}' into '{to}' (relinked {} note{})",
+                reassigned,
+                if reassigned == 1 { "" } else { "s" }
+            );
+        }
+    }
+    Ok(())
+}
+
+fn tag_merge(storage: &StorageHandle, args: TagMergeArgs) -> Result<()> {
+    let from = args.from.trim();
+    if from.is_empty() {
+        bail!("source tag cannot be empty");
+    }
+    let mut into = args.into.trim().to_string();
+    if into.is_empty() {
+        bail!("target tag cannot be empty");
+    }
+    if into.len() > 64 {
+        into.truncate(64);
+    }
+    if from.eq_ignore_ascii_case(&into) {
+        bail!("source and target tags must differ");
+    }
+
+    if !storage
+        .tag_exists(&into)
+        .with_context(|| format!("checking if tag '{into}' exists"))?
+    {
+        bail!("target tag '{into}' does not exist");
+    }
+
+    let outcome = storage
+        .rename_tag(from, &into)
+        .with_context(|| format!("merging tag '{from}' into '{into}'"))?;
+    match outcome {
+        TagRenameOutcome::Merged {
+            from,
+            to,
+            reassigned,
+        } => {
+            println!(
+                "Merged tag '{from}' into '{to}' (relinked {} note{})",
+                reassigned,
+                if reassigned == 1 { "" } else { "s" }
+            );
+        }
+        TagRenameOutcome::Renamed { from, to } => {
+            println!("Renamed tag '{from}' to '{to}' (target was missing, renamed instead)");
+        }
+    }
+    Ok(())
+}
+
+fn tag_delete(storage: &StorageHandle, args: TagDeleteArgs) -> Result<()> {
+    let tag = args.tag.trim();
+    if tag.is_empty() {
+        bail!("tag cannot be empty");
+    }
+    let outcome = storage
+        .delete_tag(tag)
+        .with_context(|| format!("deleting tag '{tag}'"))?;
+    let plural = if outcome.detached == 1 { "" } else { "s" };
+    println!(
+        "Deleted tag '{}' (removed from {} note{})",
+        outcome.tag, outcome.detached, plural
+    );
     Ok(())
 }
 
@@ -388,6 +518,96 @@ mod tests {
 
         assert!(output.contains("Regex Note"));
         assert!(!output.contains("Regex Miss"));
+        Ok(())
+    }
+
+    #[test]
+    fn cli_tag_rename_updates_tag() -> TestResult {
+        let (_temp_dir, storage) = setup_storage()?;
+        let note_id = storage.create_note("Rename target", "body", false)?;
+        storage.add_tag_to_note(note_id, "alpha")?;
+
+        tag_rename(
+            &storage,
+            TagRenameArgs {
+                from: "alpha".into(),
+                to: "beta".into(),
+            },
+        )?;
+
+        let tags = storage
+            .fetch_recent_notes(5)?
+            .into_iter()
+            .find(|note| note.id == note_id)
+            .expect("note present")
+            .tags;
+        assert!(tags.contains(&"beta".to_string()));
+        assert!(!tags.iter().any(|tag| tag == "alpha"));
+        Ok(())
+    }
+
+    #[test]
+    fn cli_tag_merge_combines_tags() -> TestResult {
+        let (_temp_dir, storage) = setup_storage()?;
+        let alpha_note = storage.create_note("Alpha note", "body", false)?;
+        let beta_note = storage.create_note("Beta note", "body", false)?;
+        storage.add_tag_to_note(alpha_note, "alpha")?;
+        storage.add_tag_to_note(beta_note, "beta")?;
+
+        tag_merge(
+            &storage,
+            TagMergeArgs {
+                from: "alpha".into(),
+                into: "beta".into(),
+            },
+        )?;
+
+        let notes = storage.fetch_recent_notes(10)?;
+        let alpha_tags = notes
+            .iter()
+            .find(|note| note.id == alpha_note)
+            .expect("alpha note present")
+            .tags
+            .clone();
+        assert!(alpha_tags.contains(&"beta".to_string()));
+        assert!(!alpha_tags.iter().any(|tag| tag == "alpha"));
+
+        // The beta note should still have beta only.
+        let beta_tags = notes
+            .iter()
+            .find(|note| note.id == beta_note)
+            .expect("beta note present")
+            .tags
+            .clone();
+        assert!(beta_tags.contains(&"beta".to_string()));
+        assert!(!beta_tags.iter().any(|tag| tag == "alpha"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn cli_tag_delete_removes_tag_globally() -> TestResult {
+        let (_temp_dir, storage) = setup_storage()?;
+        let note_id = storage.create_note("Delete tag note", "body", false)?;
+        storage.add_tag_to_note(note_id, "obsolete")?;
+
+        tag_delete(
+            &storage,
+            TagDeleteArgs {
+                tag: "obsolete".into(),
+            },
+        )?;
+
+        let tags = storage
+            .fetch_recent_notes(5)?
+            .into_iter()
+            .find(|note| note.id == note_id)
+            .expect("note present")
+            .tags;
+        assert!(!tags.iter().any(|tag| tag == "obsolete"));
+
+        let all_tags = storage.list_all_tags()?;
+        assert!(!all_tags.iter().any(|tag| tag == "obsolete"));
         Ok(())
     }
 

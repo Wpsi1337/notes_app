@@ -88,7 +88,7 @@ backups (
 );
 ```
 
-Triggers keep `updated_at` correct, refresh `fts_notes`, and cascade tag deletions. Deleted notes move to “trash” by setting `deleted_at` rather than removing rows; purge jobs vacuum rows older than the retention window.
+Triggers keep `updated_at` correct, refresh `fts_notes`, and cascade tag deletions. Deleted notes move to “trash” by setting `deleted_at` rather than removing rows; the UI shows a countdown derived from the configurable `retention_days`. When that window elapses the app purges the rows on the next maintenance sweep, while `retention_days = 0` disables automatic purging so bulk actions (restore-all / purge-all) are opt-in.
 
 ## State & event flow
 

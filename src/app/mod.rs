@@ -17,14 +17,17 @@ use ratatui::Terminal;
 use time::format_description::well_known::Rfc3339;
 
 use crate::config::{AppConfig, ConfigPaths};
-use crate::journaling::{AutoSaveEvent, AutoSaveRuntime, AutoSaveStatus, RecoverySnapshot};
-use crate::storage::StorageHandle;
+use crate::journaling::{AutoSaveEvent, AutoSaveRuntime, AutoSaveStatus};
+use crate::storage::{StorageHandle, TagDeleteOutcome, TagRenameOutcome};
 use crate::ui;
 
 mod actions;
 pub mod state;
 
-pub use state::{AppState, EditorState, FocusPane, NoteSummary, OverlayState, TagEditorMode};
+pub use state::{
+    AppState, BulkTrashAction, EditorState, FocusPane, NoteSummary, OverlayState, TagEditorMode,
+    TagInputKind,
+};
 
 enum Action {
     Quit,
@@ -42,6 +45,8 @@ enum Action {
     ToggleRegex,
     ToggleTrashView,
     RestoreNote,
+    RestoreAllTrash,
+    PurgeAllTrash,
     ShowTagEditor,
     ToggleWrap,
     ManualSave,
@@ -55,13 +60,15 @@ pub struct App {
     should_quit: bool,
     tick_rate: Duration,
     auto_save: AutoSaveRuntime,
-    recovery_snapshots: Vec<RecoverySnapshot>,
 }
 
 impl App {
     pub fn new(config: Arc<AppConfig>, storage: StorageHandle, paths: ConfigPaths) -> Result<Self> {
         let preview_lines = config.preview_lines as usize;
-        let mut state = AppState::load(&storage, preview_lines)
+        if let Err(err) = storage.purge_expired_trash(config.retention_days) {
+            tracing::warn!(?err, "failed to purge expired trash on startup");
+        }
+        let mut state = AppState::load(&storage, preview_lines, config.retention_days)
             .context("loading note summaries for initial state")?;
         let mut list_state = ListState::default();
         if !state.is_empty() {
@@ -75,10 +82,9 @@ impl App {
             .context("loading autosave recovery snapshots")?;
         state.set_autosave_status(auto_save.status());
         if !recovery_snapshots.is_empty() {
-            state.set_status_message(Some(format!(
-                "Recovered {} autosave draft(s); open the note and press 'e' to review.",
-                recovery_snapshots.len()
-            )));
+            state
+                .open_recovery_overlay(&storage, recovery_snapshots)
+                .context("preparing autosave recovery overlay")?;
         }
         Ok(Self {
             config,
@@ -88,7 +94,6 @@ impl App {
             should_quit: false,
             tick_rate: Duration::from_millis(250),
             auto_save,
-            recovery_snapshots,
         })
     }
 
@@ -101,10 +106,6 @@ impl App {
 
     pub fn autosave_status(&self) -> AutoSaveStatus {
         self.auto_save.status()
-    }
-
-    pub fn take_recovery_snapshots(&mut self) -> Vec<RecoverySnapshot> {
-        std::mem::take(&mut self.recovery_snapshots)
     }
 
     pub fn discard_recovery_snapshot(&self, note_id: i64) -> Result<()> {
@@ -260,6 +261,20 @@ impl App {
             {
                 Some(Action::RestoreNote)
             }
+            KeyCode::Char('U')
+                if !key.modifiers.intersects(
+                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                ) =>
+            {
+                Some(Action::RestoreAllTrash)
+            }
+            KeyCode::Char('P')
+                if !key.modifiers.intersects(
+                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                ) =>
+            {
+                Some(Action::PurgeAllTrash)
+            }
             KeyCode::Char('W') => Some(Action::ToggleWrap),
             KeyCode::Char('t')
                 if !key.modifiers.intersects(
@@ -310,6 +325,9 @@ impl App {
             Action::SelectPrevious => self.state.move_selection(-1),
             Action::ToggleFocus => self.state.toggle_focus(),
             Action::Refresh => {
+                if self.state.show_trash {
+                    self.run_trash_maintenance();
+                }
                 if let Err(err) = self.state.refresh(&self.storage) {
                     tracing::error!(?err, "failed to refresh notes from storage");
                 }
@@ -332,6 +350,8 @@ impl App {
             Action::ToggleRegex => self.handle_toggle_regex(),
             Action::ToggleTrashView => self.handle_toggle_trash_view(),
             Action::RestoreNote => self.handle_restore_note(),
+            Action::RestoreAllTrash => self.handle_restore_all_trash_request(),
+            Action::PurgeAllTrash => self.handle_purge_all_trash_request(),
             Action::ShowTagEditor => self.handle_show_tag_editor(),
             Action::ToggleWrap => self.handle_toggle_wrap(),
             Action::ManualSave => {
@@ -424,21 +444,27 @@ impl App {
                 }
                 true
             }
+            Some(OverlayState::BulkTrash(_)) => self.handle_bulk_trash_overlay_key(key),
             Some(OverlayState::TagEditor(_)) => {
-                let mode = self
-                    .state
-                    .tag_editor_overlay()
-                    .map(|overlay| overlay.mode.clone())
-                    .unwrap_or(TagEditorMode::Browse);
+                let mode = self.state.tag_editor_mode();
                 match mode {
-                    TagEditorMode::Adding => {
+                    TagEditorMode::Input(kind) => {
                         match key.code {
                             KeyCode::Esc => {
                                 self.state.tag_editor_cancel_input();
+                                self.state.tag_editor_set_status("Input canceled");
                             }
-                            KeyCode::Enter => {
-                                self.state.tag_editor_commit_input();
-                            }
+                            KeyCode::Enter => match kind {
+                                TagInputKind::Add => {
+                                    self.state.tag_editor_commit_input();
+                                }
+                                TagInputKind::Rename { original } => {
+                                    self.handle_tag_editor_rename(original);
+                                }
+                                TagInputKind::Merge { source } => {
+                                    self.handle_tag_editor_merge(source);
+                                }
+                            },
                             KeyCode::Backspace => {
                                 self.state.tag_editor_pop_char();
                             }
@@ -448,6 +474,19 @@ impl App {
                                 ) =>
                             {
                                 self.state.tag_editor_push_char(ch);
+                            }
+                            _ => {}
+                        }
+                        true
+                    }
+                    TagEditorMode::ConfirmDelete { tag } => {
+                        match key.code {
+                            KeyCode::Esc | KeyCode::Char('n') => {
+                                self.state.tag_editor_cancel_input();
+                                self.state.tag_editor_set_status("Delete canceled");
+                            }
+                            KeyCode::Char('y') | KeyCode::Enter => {
+                                self.handle_tag_editor_delete(tag);
                             }
                             _ => {}
                         }
@@ -476,6 +515,27 @@ impl App {
                             {
                                 self.state.tag_editor_toggle_selection();
                             }
+                            KeyCode::Char('r')
+                                if !key.modifiers.intersects(
+                                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                                ) =>
+                            {
+                                self.state.tag_editor_begin_rename();
+                            }
+                            KeyCode::Char('m')
+                                if !key.modifiers.intersects(
+                                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                                ) =>
+                            {
+                                self.state.tag_editor_begin_merge();
+                            }
+                            KeyCode::Char('x')
+                                if !key.modifiers.intersects(
+                                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                                ) =>
+                            {
+                                self.state.tag_editor_begin_delete();
+                            }
                             KeyCode::Char('j') | KeyCode::Down => {
                                 self.state.tag_editor_move_selection(1);
                             }
@@ -494,17 +554,228 @@ impl App {
                     }
                 }
             }
+            Some(OverlayState::Recovery(_)) => self.handle_recovery_overlay_key(key),
             None => false,
+        }
+    }
+
+    fn handle_bulk_trash_overlay_key(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                self.state.close_overlay();
+                self.state
+                    .set_status_message(Some("Bulk trash action canceled"));
+                true
+            }
+            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.execute_bulk_trash_action();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn handle_recovery_overlay_key(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Esc => {
+                self.state.close_overlay();
+                self.state
+                    .set_status_message(Some("Autosave review dismissed"));
+                true
+            }
+            KeyCode::Enter => {
+                self.handle_recovery_restore();
+                true
+            }
+            KeyCode::Char('d') if key.modifiers.is_empty() => {
+                self.handle_recovery_discard(false);
+                true
+            }
+            KeyCode::Char('D') if key.modifiers.is_empty() => {
+                self.handle_recovery_discard(true);
+                true
+            }
+            KeyCode::Char('j') if key.modifiers.is_empty() => {
+                self.state.recovery_move_selection(1);
+                true
+            }
+            KeyCode::Char('k') if key.modifiers.is_empty() => {
+                self.state.recovery_move_selection(-1);
+                true
+            }
+            KeyCode::Down => {
+                self.state.recovery_move_selection(1);
+                true
+            }
+            KeyCode::Up => {
+                self.state.recovery_move_selection(-1);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn execute_bulk_trash_action(&mut self) {
+        let action = match self.state.bulk_trash_action() {
+            Some(action) => action,
+            None => return,
+        };
+        match action {
+            BulkTrashAction::RestoreAll => self.perform_restore_all_trash(),
+            BulkTrashAction::PurgeAll => self.perform_purge_all_trash(),
+        }
+    }
+
+    fn handle_recovery_restore(&mut self) {
+        let entry = match self.state.recovery_selected_entry().cloned() {
+            Some(entry) => entry,
+            None => {
+                self.state
+                    .set_status_message(Some("No autosave draft selected"));
+                return;
+            }
+        };
+
+        let body = entry.body.clone();
+        let mut target_id = entry.note_id;
+        match self.storage.fetch_note_by_id(entry.note_id) {
+            Ok(Some(_)) => {
+                if let Err(err) = self.storage.update_note_body(entry.note_id, &body) {
+                    tracing::error!(
+                        ?err,
+                        note_id = entry.note_id,
+                        "failed to apply recovered body"
+                    );
+                    self.state
+                        .set_status_message(Some("Failed to apply recovered draft"));
+                    return;
+                }
+            }
+            Ok(None) => {
+                let title = if entry.missing {
+                    format!("Recovered {}", entry.saved_at)
+                } else {
+                    entry.title.clone()
+                };
+                match self.storage.create_note(&title, &body, false) {
+                    Ok(new_id) => target_id = new_id,
+                    Err(err) => {
+                        tracing::error!(?err, "failed to create recovered note");
+                        self.state
+                            .set_status_message(Some("Failed to create recovered note"));
+                        return;
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::error!(
+                    ?err,
+                    note_id = entry.note_id,
+                    "failed to fetch note for recovery"
+                );
+                self.state
+                    .set_status_message(Some("Failed to load note for recovery"));
+                return;
+            }
+        }
+
+        if let Err(err) = self.auto_save.discard_snapshot(entry.note_id) {
+            tracing::warn!(
+                ?err,
+                note_id = entry.note_id,
+                "failed to discard autosave snapshot"
+            );
+        }
+
+        self.state.recovery_remove_selected();
+
+        if let Err(err) = self.state.refresh(&self.storage) {
+            tracing::error!(?err, "failed to refresh after recovery");
+            self.state
+                .set_status_message(Some("Recovered draft applied, refresh failed"));
+            return;
+        }
+
+        self.state.select_note_by_id(target_id);
+
+        if let Some(note) = self.state.selected().cloned() {
+            if let Err(err) = self.start_editing_internal(&note) {
+                tracing::error!(?err, "failed to enter edit mode for recovered note");
+                self.state
+                    .set_status_message(Some("Recovered note updated"));
+            } else {
+                self.state.set_status_message(Some(format!(
+                    "Recovered autosave for note #{}",
+                    target_id
+                )));
+            }
+        } else {
+            self.state
+                .set_status_message(Some("Recovered draft applied"));
+        }
+    }
+
+    fn handle_recovery_discard(&mut self, discard_all: bool) {
+        if discard_all {
+            let entries = self.state.recovery_entries().to_vec();
+            if entries.is_empty() {
+                self.state.close_overlay();
+                return;
+            }
+            for entry in &entries {
+                if let Err(err) = self.auto_save.discard_snapshot(entry.note_id) {
+                    tracing::warn!(
+                        ?err,
+                        note_id = entry.note_id,
+                        "failed to discard autosave snapshot"
+                    );
+                }
+            }
+            self.state.close_overlay();
+            self.state
+                .set_status_message(Some("Discarded all autosave drafts"));
+            return;
+        }
+
+        let entry = match self.state.recovery_selected_entry().cloned() {
+            Some(entry) => entry,
+            None => {
+                self.state
+                    .set_status_message(Some("No autosave draft selected"));
+                return;
+            }
+        };
+
+        if let Err(err) = self.auto_save.discard_snapshot(entry.note_id) {
+            tracing::warn!(
+                ?err,
+                note_id = entry.note_id,
+                "failed to discard autosave snapshot"
+            );
+        }
+
+        self.state.recovery_remove_selected();
+        if self.state.recovery_overlay().is_some() {
+            self.state.set_status_message(Some(format!(
+                "Discarded autosave for note #{}",
+                entry.note_id
+            )));
+        } else {
+            self.state
+                .set_status_message(Some("No autosave drafts remaining"));
         }
     }
 
     fn handle_toggle_trash_view(&mut self) {
         let enabled = !self.state.show_trash;
+        if enabled {
+            self.run_trash_maintenance();
+        }
         match self.state.set_trash_view(enabled, &self.storage) {
             Ok(()) => {
                 if enabled {
                     self.state.set_status_message(Some(
-                        "Trash view: j/k browse • u restore • d delete • T exit",
+                        "Trash view: j/k browse • u restore • d delete • Shift+U restore all • Shift+P purge all • T exit",
                     ));
                 } else {
                     self.state.set_status_message(Some("Back to active notes"));
@@ -533,6 +804,104 @@ impl App {
                 self.state
                     .set_status_message(Some("Failed to restore note"));
             }
+        }
+    }
+
+    fn handle_restore_all_trash_request(&mut self) {
+        if !self.state.show_trash {
+            self.state
+                .set_status_message(Some("Restore-all available only in trash view"));
+            return;
+        }
+        if self.state.len() == 0 {
+            self.state.set_status_message(Some("Trash already empty"));
+            return;
+        }
+        if self.state.overlay().is_some() {
+            return;
+        }
+        self.state
+            .open_bulk_trash_overlay(BulkTrashAction::RestoreAll);
+        self.state.set_status_message(Some(
+            "Restore all notes from trash? Enter confirms • Esc cancels",
+        ));
+    }
+
+    fn handle_purge_all_trash_request(&mut self) {
+        if !self.state.show_trash {
+            self.state
+                .set_status_message(Some("Purge-all available only in trash view"));
+            return;
+        }
+        if self.state.len() == 0 {
+            self.state.set_status_message(Some("Trash already empty"));
+            return;
+        }
+        if self.state.overlay().is_some() {
+            return;
+        }
+        self.state
+            .open_bulk_trash_overlay(BulkTrashAction::PurgeAll);
+        self.state.set_status_message(Some(
+            "Permanently delete all trashed notes? Enter confirms • Esc cancels",
+        ));
+    }
+
+    fn perform_restore_all_trash(&mut self) {
+        let dispatcher = actions::ActionDispatcher::new(&self.storage);
+        match dispatcher.restore_all_trash() {
+            Ok(count) => {
+                self.state.close_overlay();
+                if let Err(err) = self.state.refresh(&self.storage) {
+                    tracing::error!(?err, "failed to refresh after restoring trash");
+                    self.state
+                        .set_status_message(Some("Restored notes, refresh failed"));
+                    return;
+                }
+                let message = if count == 0 {
+                    "Trash was already empty".to_string()
+                } else {
+                    format!("Restored {count} note{}", if count == 1 { "" } else { "s" })
+                };
+                self.state.set_status_message(Some(message));
+            }
+            Err(err) => {
+                tracing::error!(?err, "failed to restore all trash");
+                self.state
+                    .set_status_message(Some("Failed to restore trashed notes"));
+            }
+        }
+    }
+
+    fn perform_purge_all_trash(&mut self) {
+        let dispatcher = actions::ActionDispatcher::new(&self.storage);
+        match dispatcher.purge_all_trash() {
+            Ok(count) => {
+                self.state.close_overlay();
+                if let Err(err) = self.state.refresh(&self.storage) {
+                    tracing::error!(?err, "failed to refresh after purging trash");
+                    self.state
+                        .set_status_message(Some("Purged notes, refresh failed"));
+                    return;
+                }
+                let message = if count == 0 {
+                    "Trash already empty".to_string()
+                } else {
+                    format!("Purged {count} note{}", if count == 1 { "" } else { "s" })
+                };
+                self.state.set_status_message(Some(message));
+            }
+            Err(err) => {
+                tracing::error!(?err, "failed to purge trash");
+                self.state
+                    .set_status_message(Some("Failed to purge trashed notes"));
+            }
+        }
+    }
+
+    fn run_trash_maintenance(&mut self) {
+        if let Err(err) = self.storage.purge_expired_trash(self.config.retention_days) {
+            tracing::warn!(?err, "failed to purge expired trash");
         }
     }
 
@@ -1015,8 +1384,7 @@ impl App {
                 "Editing note: type to modify • Esc exit • Ctrl-s save",
             ));
         }
-        self.recovery_snapshots
-            .retain(|entry| entry.note_id != note.id);
+        self.state.recovery_remove_for_note(note.id);
         self.state.set_autosave_status(self.auto_save.status());
         Ok(())
     }
@@ -1112,6 +1480,394 @@ impl App {
                     .set_status_message(Some("Tags updated, refresh failed"));
             }
         }
+    }
+
+    fn handle_tag_editor_rename(&mut self, original: String) {
+        let Some(target) = self.state.tag_editor_input_value() else {
+            self.state
+                .tag_editor_set_status("Enter a new tag name first");
+            return;
+        };
+        if target.trim().is_empty() {
+            self.state.tag_editor_set_status("Tag name cannot be empty");
+            return;
+        }
+        let dispatcher = actions::ActionDispatcher::new(&self.storage);
+        match dispatcher.rename_tag(&original, &target) {
+            Ok(TagRenameOutcome::Renamed { from, to }) => {
+                self.state.tag_editor_finish_rename(&from, &to);
+                self.refresh_after_tag_update();
+            }
+            Ok(TagRenameOutcome::Merged {
+                from,
+                to,
+                reassigned,
+            }) => {
+                self.state.tag_editor_finish_merge(&from, &to);
+                self.refresh_after_tag_update();
+                self.state.tag_editor_set_status(format!(
+                    "Merged '{from}' into '{to}' ({reassigned} notes updated)"
+                ));
+            }
+            Err(err) => {
+                tracing::error!(?err, original, target, "tag rename failed");
+                self.state
+                    .tag_editor_set_status(format!("Rename failed: {err}"));
+            }
+        }
+    }
+
+    fn handle_tag_editor_merge(&mut self, source: String) {
+        let Some(target) = self.state.tag_editor_input_value() else {
+            self.state
+                .tag_editor_set_status("Enter a target tag to merge into");
+            return;
+        };
+        let trimmed = target.trim();
+        if trimmed.is_empty() {
+            self.state
+                .tag_editor_set_status("Target tag cannot be empty");
+            return;
+        }
+        if trimmed.eq_ignore_ascii_case(&source) {
+            self.state
+                .tag_editor_set_status("Choose a different target tag");
+            return;
+        }
+        match self.storage.tag_exists(trimmed) {
+            Ok(false) => {
+                self.state
+                    .tag_editor_set_status("Target tag does not exist");
+                return;
+            }
+            Err(err) => {
+                tracing::error!(?err, target = trimmed, "failed to check tag existence");
+                self.state
+                    .tag_editor_set_status("Unable to verify target tag");
+                return;
+            }
+            Ok(true) => {}
+        }
+
+        let dispatcher = actions::ActionDispatcher::new(&self.storage);
+        match dispatcher.rename_tag(&source, trimmed) {
+            Ok(TagRenameOutcome::Merged {
+                from,
+                to,
+                reassigned,
+            }) => {
+                self.state.tag_editor_finish_merge(&from, &to);
+                self.refresh_after_tag_update();
+                self.state.tag_editor_set_status(format!(
+                    "Merged '{from}' into '{to}' ({reassigned} notes updated)"
+                ));
+            }
+            Ok(TagRenameOutcome::Renamed { from, to }) => {
+                // This happens if the target differs only by case.
+                self.state.tag_editor_finish_rename(&from, &to);
+                self.refresh_after_tag_update();
+            }
+            Err(err) => {
+                tracing::error!(?err, source, target = trimmed, "tag merge failed");
+                self.state
+                    .tag_editor_set_status(format!("Merge failed: {err}"));
+            }
+        }
+    }
+
+    fn handle_tag_editor_delete(&mut self, tag: String) {
+        let dispatcher = actions::ActionDispatcher::new(&self.storage);
+        match dispatcher.delete_tag(&tag) {
+            Ok(TagDeleteOutcome { detached, .. }) => {
+                self.state.tag_editor_finish_delete(&tag);
+                self.refresh_after_tag_update();
+                self.state.tag_editor_set_status(format!(
+                    "Deleted '{tag}' (removed from {detached} notes)"
+                ));
+            }
+            Err(err) => {
+                tracing::error!(?err, tag, "tag delete failed");
+                self.state
+                    .tag_editor_set_status(format!("Delete failed: {err}"));
+            }
+        }
+    }
+
+    fn refresh_after_tag_update(&mut self) {
+        if let Err(err) = self.state.refresh(&self.storage) {
+            tracing::error!(?err, "failed to refresh after tag update");
+            self.state
+                .set_status_message(Some("Tag updated but refresh failed"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{AppConfig, ConfigPaths, StorageOptions};
+    use crate::storage;
+    use anyhow::Result;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use tempfile::TempDir;
+
+    fn temp_paths(root: &TempDir) -> ConfigPaths {
+        let base = root.path();
+        ConfigPaths {
+            config_dir: base.join("config"),
+            config_file: base.join("config/config.toml"),
+            data_dir: base.join("data"),
+            database_path: base.join("data/notes.db"),
+            cache_dir: base.join("cache"),
+            backup_dir: base.join("backups"),
+            log_dir: base.join("logs"),
+            state_dir: base.join("state"),
+        }
+    }
+
+    fn storage_options(paths: &ConfigPaths) -> StorageOptions {
+        let mut opts = StorageOptions::default();
+        opts.database_path = paths.database_path.clone();
+        opts.backup_dir = paths.backup_dir.clone();
+        opts.backup_on_exit = false;
+        opts
+    }
+
+    fn setup_app_with_note(tags: &[&str]) -> Result<(TempDir, App, i64)> {
+        let temp = TempDir::new()?;
+        let paths = temp_paths(&temp);
+        paths.ensure_directories()?;
+
+        let storage_opts = storage_options(&paths);
+        let storage = storage::init(&paths, &storage_opts)?;
+
+        let note_id = storage.create_note("Tagged note", "body", false)?;
+        for tag in tags {
+            storage.add_tag_to_note(note_id, tag)?;
+        }
+
+        let mut config = AppConfig::default();
+        config.storage.database_path = storage_opts.database_path.clone();
+        config.storage.backup_dir = storage_opts.backup_dir.clone();
+        config.storage.wal_autocheckpoint = storage_opts.wal_autocheckpoint;
+        config.storage.backup_on_exit = false;
+        config.auto_save.enabled = false;
+        config.auto_save.crash_recovery = false;
+
+        let app = App::new(Arc::new(config), storage.clone(), paths)?;
+
+        Ok((temp, app, note_id))
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        app.handle_key(KeyEvent::new(code, KeyModifiers::empty()));
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for ch in text.chars() {
+            press(app, KeyCode::Char(ch));
+        }
+    }
+
+    fn backspace(app: &mut App, count: usize) {
+        for _ in 0..count {
+            press(app, KeyCode::Backspace);
+        }
+    }
+
+    fn open_tag_editor_via_keys(app: &mut App) {
+        press(app, KeyCode::Char('t'));
+        assert!(matches!(
+            app.state.overlay(),
+            Some(OverlayState::TagEditor(_))
+        ));
+    }
+
+    #[test]
+    fn tag_editor_rename_flow_updates_storage() -> Result<()> {
+        let (_temp, mut app, note_id) = setup_app_with_note(&["alpha"])?;
+        app.state.select_note_by_id(note_id);
+        app.state.open_tag_editor(&app.storage)?;
+        app.state.tag_editor_begin_rename();
+        {
+            let editor = app.state.tag_editor_overlay_mut().expect("overlay open");
+            editor.input.clear();
+            editor.input.push_str("beta");
+        }
+        app.handle_tag_editor_rename("alpha".to_string());
+
+        let tags = app
+            .storage
+            .fetch_recent_notes(10)?
+            .into_iter()
+            .find(|note| note.id == note_id)
+            .expect("note present")
+            .tags;
+        assert!(tags.iter().any(|tag| tag == "beta"));
+        assert!(!tags.iter().any(|tag| tag == "alpha"));
+
+        let overlay = app.state.tag_editor_overlay().expect("overlay present");
+        assert_eq!(
+            overlay.status.as_deref(),
+            Some("Renamed tag 'alpha' → 'beta'")
+        );
+        assert!(overlay
+            .items
+            .iter()
+            .any(|item| item.name == "beta" && item.selected));
+
+        Ok(())
+    }
+
+    #[test]
+    fn tag_editor_merge_flow_merges_tags() -> Result<()> {
+        let (_temp, mut app, note_id) = setup_app_with_note(&["alpha", "beta"])?;
+        app.state.select_note_by_id(note_id);
+        app.state.open_tag_editor(&app.storage)?;
+        app.state.tag_editor_begin_merge();
+        {
+            let editor = app.state.tag_editor_overlay_mut().expect("overlay open");
+            editor.input.clear();
+            editor.input.push_str("beta");
+        }
+        app.handle_tag_editor_merge("alpha".to_string());
+
+        let tags = app
+            .storage
+            .fetch_recent_notes(10)?
+            .into_iter()
+            .find(|note| note.id == note_id)
+            .expect("note present")
+            .tags;
+        assert!(tags.iter().any(|tag| tag == "beta"));
+        assert!(!tags.iter().any(|tag| tag == "alpha"));
+
+        let overlay = app.state.tag_editor_overlay().expect("overlay present");
+        let status = overlay.status.as_deref().unwrap_or("");
+        assert!(
+            status.starts_with("Merged 'alpha' into 'beta'"),
+            "unexpected status: {status}"
+        );
+        assert_eq!(overlay.items.len(), 1);
+        assert_eq!(overlay.items[0].name, "beta");
+        assert!(overlay.items[0].selected);
+
+        Ok(())
+    }
+
+    #[test]
+    fn tag_editor_delete_flow_removes_tag() -> Result<()> {
+        let (_temp, mut app, note_id) = setup_app_with_note(&["obsolete"])?;
+        app.state.select_note_by_id(note_id);
+        app.state.open_tag_editor(&app.storage)?;
+        app.state.tag_editor_begin_delete();
+        app.handle_tag_editor_delete("obsolete".to_string());
+
+        let tags = app
+            .storage
+            .fetch_recent_notes(10)?
+            .into_iter()
+            .find(|note| note.id == note_id)
+            .expect("note present")
+            .tags;
+        assert!(tags.is_empty());
+
+        let all_tags = app.storage.list_all_tags()?;
+        assert!(!all_tags.iter().any(|tag| tag == "obsolete"));
+
+        let overlay = app.state.tag_editor_overlay().expect("overlay present");
+        assert!(overlay.items.is_empty());
+        let status = overlay.status.as_deref().unwrap_or("");
+        assert!(
+            status.starts_with("Deleted 'obsolete'"),
+            "unexpected status: {status}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn tag_editor_rename_via_keys_updates_storage() -> Result<()> {
+        let (_temp, mut app, note_id) = setup_app_with_note(&["alpha"])?;
+        app.state.select_note_by_id(note_id);
+        open_tag_editor_via_keys(&mut app);
+
+        press(&mut app, KeyCode::Char('r'));
+        backspace(&mut app, "alpha".len());
+        type_text(&mut app, "beta");
+        press(&mut app, KeyCode::Enter);
+
+        let tags = app
+            .storage
+            .fetch_recent_notes(10)?
+            .into_iter()
+            .find(|note| note.id == note_id)
+            .expect("note present")
+            .tags;
+        assert!(tags.iter().any(|tag| tag == "beta"));
+        assert!(!tags.iter().any(|tag| tag == "alpha"));
+
+        let overlay = app.state.tag_editor_overlay().expect("overlay present");
+        assert!(overlay
+            .items
+            .iter()
+            .any(|item| item.name == "beta" && item.selected));
+
+        Ok(())
+    }
+
+    #[test]
+    fn tag_editor_merge_via_keys_merges_tags() -> Result<()> {
+        let (_temp, mut app, note_id) = setup_app_with_note(&["alpha", "beta"])?;
+        app.state.select_note_by_id(note_id);
+        open_tag_editor_via_keys(&mut app);
+
+        press(&mut app, KeyCode::Char('m'));
+        type_text(&mut app, "beta");
+        press(&mut app, KeyCode::Enter);
+
+        let tags = app
+            .storage
+            .fetch_recent_notes(10)?
+            .into_iter()
+            .find(|note| note.id == note_id)
+            .expect("note present")
+            .tags;
+        assert_eq!(tags, vec!["beta".to_string()]);
+
+        let overlay = app.state.tag_editor_overlay().expect("overlay present");
+        assert_eq!(overlay.items.len(), 1);
+        assert_eq!(overlay.items[0].name, "beta");
+        assert!(overlay.items[0].selected);
+
+        Ok(())
+    }
+
+    #[test]
+    fn tag_editor_delete_via_keys_removes_tag() -> Result<()> {
+        let (_temp, mut app, note_id) = setup_app_with_note(&["obsolete"])?;
+        app.state.select_note_by_id(note_id);
+        open_tag_editor_via_keys(&mut app);
+
+        press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Char('y'));
+
+        let tags = app
+            .storage
+            .fetch_recent_notes(10)?
+            .into_iter()
+            .find(|note| note.id == note_id)
+            .expect("note present")
+            .tags;
+        assert!(tags.is_empty());
+
+        let all_tags = app.storage.list_all_tags()?;
+        assert!(!all_tags.iter().any(|tag| tag == "obsolete"));
+
+        let overlay = app.state.tag_editor_overlay().expect("overlay present");
+        assert!(overlay.items.is_empty());
+
+        Ok(())
     }
 }
 
