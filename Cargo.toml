@@ -1,0 +1,49 @@
+[package]
+name = "notes-tui"
+version = "0.1.0"
+edition = "2021"
+authors = ["Notes TUI Team"]
+license = "MIT OR Apache-2.0"
+rust-version = "1.78"
+description = "Keyboard-first terminal note-taking application with fuzzy search and resilient storage."
+readme = "README.md"
+repository = ""
+keywords = ["tui", "notes", "sqlite", "terminal"]
+categories = ["command-line-utilities"]
+
+[features]
+default = ["sqlite-bundled"]
+sqlite-bundled = ["rusqlite/bundled"]
+sqlite-system = []
+
+[dependencies]
+anyhow = "1.0.82"
+thiserror = "1.0.58"
+serde = { version = "1.0.203", features = ["derive"] }
+serde_with = "3.8.1"
+toml = "0.8.14"
+serde_json = "1.0.117"
+directories = "5.0.1"
+clap = { version = "4.5.4", features = ["derive"] }
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter", "fmt", "time"] }
+time = { version = "0.3.37", features = ["macros", "formatting", "parsing"] }
+rusqlite = { version = "0.31.0", default-features = false, features = ["unlock_notify"] }
+ratatui = { version = "0.27.0", default-features = false, features = ["crossterm"] }
+crossterm = "0.27.0"
+parking_lot = "0.12.3"
+crossbeam-channel = "0.5.11"
+regex = "1.10.5"
+once_cell = "1.19.0"
+uuid = { version = "1.10.0", features = ["v4"] }
+strum = { version = "0.26.2", features = ["derive"] }
+indexmap = "2.2.6"
+bitflags = "2.5.0"
+atty = "0.2.14"
+unicode-segmentation = "1.10.1"
+
+[dev-dependencies]
+assert_matches = "1.5.0"
+tempfile = "3.10.1"
+insta = { version = "1.38.0", features = ["redactions"] }
+tokio = { version = "1.37.0", features = ["macros", "rt-multi-thread"] }
