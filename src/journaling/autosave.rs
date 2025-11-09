@@ -13,6 +13,7 @@ use crate::storage::StorageHandle;
 
 const SNAPSHOT_EXTENSION: &str = "json";
 const SNAPSHOT_TMP_EXTENSION: &str = "json.tmp";
+const JOURNAL_PRUNE_INTERVAL: Duration = Duration::from_secs(60 * 5);
 
 #[derive(Debug, Clone)]
 pub struct RecoverySnapshot {
@@ -56,9 +57,12 @@ pub enum AutoSaveEvent {
 pub struct AutoSaveRuntime {
     enabled: bool,
     crash_recovery: bool,
+    retention: Option<Duration>,
     debounce: Duration,
     journal_dir: PathBuf,
     session: Option<Session>,
+    prune_interval: Duration,
+    last_prune: Instant,
 }
 
 #[derive(Debug)]
@@ -93,13 +97,25 @@ impl AutoSaveRuntime {
                 format!("creating autosave journal dir {}", journal_dir.display())
             })?;
         }
-        Ok(Self {
+        let retention = config
+            .snapshot_retention()
+            .map(Duration::try_from)
+            .transpose()
+            .context("converting autosave retention duration")?;
+
+        let mut runtime = Self {
             enabled: config.enabled,
             crash_recovery: config.crash_recovery,
+            retention,
             debounce: Duration::from_millis(config.debounce_ms),
             journal_dir,
             session: None,
-        })
+            prune_interval: JOURNAL_PRUNE_INTERVAL,
+            last_prune: Instant::now(),
+        };
+        runtime.prune_journal()?;
+        runtime.last_prune = Instant::now();
+        Ok(runtime)
     }
 
     pub fn journal_dir(&self) -> &Path {
@@ -189,6 +205,7 @@ impl AutoSaveRuntime {
     }
 
     pub fn poll(&mut self, storage: &StorageHandle) -> Result<Option<AutoSaveEvent>> {
+        self.maybe_prune_journal()?;
         if !self.enabled {
             return Ok(None);
         }
@@ -221,10 +238,12 @@ impl AutoSaveRuntime {
         Self::remove_snapshot_path(&self.snapshot_path(note_id))
     }
 
-    pub fn list_recovery(&self) -> Result<Vec<RecoverySnapshot>> {
+    pub fn list_recovery(&mut self) -> Result<Vec<RecoverySnapshot>> {
         if !self.crash_recovery {
             return Ok(Vec::new());
         }
+        self.prune_journal()?;
+        self.last_prune = Instant::now();
         let mut snapshots = Vec::new();
         let dir = match fs::read_dir(&self.journal_dir) {
             Ok(dir) => dir,
@@ -248,19 +267,53 @@ impl AutoSaveRuntime {
             if !path.is_file() {
                 continue;
             }
-            if path.extension().and_then(|ext| ext.to_str()) != Some(SNAPSHOT_EXTENSION) {
+            let ext = path.extension().and_then(|ext| ext.to_str());
+            let file_name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+
+            let is_snapshot = ext == Some(SNAPSHOT_EXTENSION);
+            let is_tmp = ext == Some("tmp") && file_name.ends_with(".json.tmp");
+
+            if !is_snapshot && !is_tmp {
                 continue;
             }
-            match self.read_snapshot_path(&path) {
+
+            let snapshot_path = if is_tmp {
+                let final_path = path.with_extension(SNAPSHOT_EXTENSION);
+                if final_path.exists() {
+                    final_path
+                } else if let Err(err) = fs::rename(&path, &final_path) {
+                    tracing::warn!(
+                        ?err,
+                        from = %path.display(),
+                        to = %final_path.display(),
+                        "failed to finalise autosave snapshot; attempting to read temp file instead"
+                    );
+                    path.clone()
+                } else {
+                    final_path
+                }
+            } else {
+                path.clone()
+            };
+
+            match self.read_snapshot_path(&snapshot_path) {
                 Ok(snapshot) => snapshots.push(snapshot),
                 Err(err) => {
-                    tracing::warn!(?err, "failed to parse autosave snapshot {}", path.display());
+                    tracing::warn!(
+                        ?err,
+                        "failed to parse autosave snapshot {}",
+                        snapshot_path.display()
+                    );
+                    let _ = fs::remove_file(&snapshot_path);
                 }
             }
         }
 
         snapshots.sort_by(|a, b| match b.saved_at.cmp(&a.saved_at) {
-            Ordering::Equal => b.note_id.cmp(&a.note_id),
+            Ordering::Equal => a.note_id.cmp(&b.note_id),
             other => other,
         });
         Ok(snapshots)
@@ -413,6 +466,76 @@ impl Session {
     }
 }
 
+impl AutoSaveRuntime {
+    fn maybe_prune_journal(&mut self) -> Result<()> {
+        if !self.crash_recovery {
+            return Ok(());
+        }
+        if self.last_prune.elapsed() < self.prune_interval {
+            return Ok(());
+        }
+        self.prune_journal()?;
+        self.last_prune = Instant::now();
+        Ok(())
+    }
+
+    fn prune_journal(&self) -> Result<()> {
+        if !self.crash_recovery {
+            return Ok(());
+        }
+        let dir = match fs::read_dir(&self.journal_dir) {
+            Ok(dir) => dir,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("reading autosave journal {}", self.journal_dir.display())
+                })
+            }
+        };
+        let cutoff = self.retention.map(|ret| OffsetDateTime::now_utc() - ret);
+
+        for entry in dir {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => {
+                    tracing::warn!(?err, "skipping unreadable autosave entry");
+                    continue;
+                }
+            };
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let ext = path.extension().and_then(|ext| ext.to_str());
+            if ext == Some("tmp") {
+                let _ = fs::remove_file(&path);
+                continue;
+            }
+            if ext != Some(SNAPSHOT_EXTENSION) {
+                continue;
+            }
+            if let Some(cutoff) = cutoff {
+                match self.read_snapshot_path(&path) {
+                    Ok(snapshot) => {
+                        if snapshot.saved_at < cutoff {
+                            let _ = fs::remove_file(&path);
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            ?err,
+                            path = %path.display(),
+                            "removing unreadable autosave snapshot"
+                        );
+                        let _ = fs::remove_file(&path);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum FlushKind {
     Debounced,
@@ -469,6 +592,7 @@ mod tests {
                 debounce_ms: 0,
                 enabled: true,
                 crash_recovery: true,
+                snapshot_retention_hours: 0,
             },
         )?;
 
@@ -510,6 +634,7 @@ mod tests {
             debounce_ms: 0,
             enabled: true,
             crash_recovery: true,
+            snapshot_retention_hours: 0,
         };
 
         {
@@ -529,6 +654,96 @@ mod tests {
         assert!(recovered.is_some());
         assert_eq!(recovered.unwrap().body, "pending body");
 
+        Ok(())
+    }
+
+    #[test]
+    fn autosave_retention_prunes_expired_snapshots() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let paths = temp_paths(&temp);
+        paths.ensure_directories()?;
+
+        let journal_dir = paths.state_dir.join("autosave");
+        fs::create_dir_all(&journal_dir)?;
+
+        let retention_hours = 1;
+        let config = AutoSaveConfig {
+            debounce_ms: 0,
+            enabled: true,
+            crash_recovery: true,
+            snapshot_retention_hours: retention_hours,
+        };
+
+        // Write a snapshot that should be considered expired.
+        let stale_path = journal_dir.join("note-1.json");
+        let stale_record = SnapshotRecord {
+            note_id: 1,
+            saved_at: (OffsetDateTime::now_utc()
+                - time::Duration::hours(retention_hours as i64 + 1))
+            .unix_timestamp(),
+            body: "stale body".into(),
+        };
+        fs::write(&stale_path, serde_json::to_vec(&stale_record)?)?;
+
+        // And a fresh snapshot that should survive pruning.
+        let fresh_path = journal_dir.join("note-2.json");
+        let fresh_record = SnapshotRecord {
+            note_id: 2,
+            saved_at: OffsetDateTime::now_utc().unix_timestamp(),
+            body: "fresh body".into(),
+        };
+        fs::write(&fresh_path, serde_json::to_vec(&fresh_record)?)?;
+
+        let mut runtime = AutoSaveRuntime::new(journal_dir.clone(), &config)?;
+
+        let snapshots = runtime.list_recovery()?;
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].note_id, 2);
+        assert_eq!(snapshots[0].body, "fresh body");
+        assert!(!stale_path.exists());
+        assert!(fresh_path.exists());
+
+        Ok(())
+    }
+
+    #[test]
+    fn autosave_poll_triggers_periodic_prune() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let paths = temp_paths(&temp);
+        paths.ensure_directories()?;
+        let storage_opts = storage_options(&paths);
+        let storage = storage::init(&paths, &storage_opts)?;
+        let note_id = storage.create_note("Test", "body", false)?;
+
+        let journal_dir = paths.state_dir.join("autosave");
+        fs::create_dir_all(&journal_dir)?;
+
+        let config = AutoSaveConfig {
+            debounce_ms: 0,
+            enabled: true,
+            crash_recovery: true,
+            snapshot_retention_hours: 1,
+        };
+
+        let mut runtime = AutoSaveRuntime::new(journal_dir.clone(), &config)?;
+        runtime.start_session(note_id, "body")?;
+        runtime.end_session(note_id, false)?;
+
+        let stale_path = journal_dir.join("note-99.json");
+        let stale_record = SnapshotRecord {
+            note_id: 99,
+            saved_at: (OffsetDateTime::now_utc() - time::Duration::hours(4)).unix_timestamp(),
+            body: "orphaned".into(),
+        };
+        fs::write(&stale_path, serde_json::to_vec(&stale_record)?)?;
+
+        runtime.last_prune = Instant::now() - runtime.prune_interval - Duration::from_secs(1);
+        runtime.poll(&storage)?;
+
+        assert!(
+            !stale_path.exists(),
+            "expected periodic prune to remove expired snapshot"
+        );
         Ok(())
     }
 }

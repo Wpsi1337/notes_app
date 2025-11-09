@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io::Stdout;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -18,7 +19,7 @@ use time::format_description::well_known::Rfc3339;
 
 use crate::config::{AppConfig, ConfigPaths};
 use crate::journaling::{AutoSaveEvent, AutoSaveRuntime, AutoSaveStatus};
-use crate::storage::{StorageHandle, TagDeleteOutcome, TagRenameOutcome};
+use crate::storage::{StorageHandle, TagDeleteOutcome, TagRenameOutcome, WalCheckpointStats};
 use crate::ui;
 
 mod actions;
@@ -52,6 +53,8 @@ enum Action {
     ManualSave,
 }
 
+const WAL_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 10);
+
 pub struct App {
     pub config: Arc<AppConfig>,
     pub storage: StorageHandle,
@@ -60,6 +63,8 @@ pub struct App {
     should_quit: bool,
     tick_rate: Duration,
     auto_save: AutoSaveRuntime,
+    wal_check_interval: Duration,
+    last_wal_check: Instant,
 }
 
 impl App {
@@ -75,7 +80,7 @@ impl App {
             list_state.select(Some(state.selected));
         }
         let auto_save_dir = paths.state_dir.join("autosave");
-        let auto_save = AutoSaveRuntime::new(auto_save_dir, &config.auto_save)
+        let mut auto_save = AutoSaveRuntime::new(auto_save_dir, &config.auto_save)
             .context("initialising autosave runtime")?;
         let recovery_snapshots = auto_save
             .list_recovery()
@@ -86,7 +91,7 @@ impl App {
                 .open_recovery_overlay(&storage, recovery_snapshots)
                 .context("preparing autosave recovery overlay")?;
         }
-        Ok(Self {
+        let mut app = Self {
             config,
             storage,
             state,
@@ -94,7 +99,14 @@ impl App {
             should_quit: false,
             tick_rate: Duration::from_millis(250),
             auto_save,
-        })
+            wal_check_interval: WAL_CHECK_INTERVAL,
+            last_wal_check: Instant::now(),
+        };
+        app.last_wal_check = Instant::now()
+            .checked_sub(app.wal_check_interval)
+            .unwrap_or_else(Instant::now);
+        app.maybe_run_wal_health_check();
+        Ok(app)
     }
 
     pub fn run(&mut self) -> Result<()> {
@@ -369,6 +381,37 @@ impl App {
             }
         }
         self.state.set_autosave_status(self.auto_save.status());
+        self.maybe_run_wal_health_check();
+    }
+
+    fn maybe_run_wal_health_check(&mut self) {
+        if self.last_wal_check.elapsed() < self.wal_check_interval {
+            return;
+        }
+        match self.storage.run_wal_health_check() {
+            Ok(stats) => self.handle_wal_checkpoint_stats(stats),
+            Err(err) => {
+                tracing::error!(?err, "wal health check failed");
+                self.state
+                    .set_status_message(Some("WAL checkpoint failed — see logs"));
+            }
+        }
+        self.last_wal_check = Instant::now();
+    }
+
+    fn handle_wal_checkpoint_stats(&mut self, stats: WalCheckpointStats) {
+        if stats.busy_frames > 0 {
+            tracing::warn!(?stats, "wal checkpoint skipped busy frames");
+            self.state.set_status_message(Some(
+                "Database is busy (another Notes TUI instance is open)",
+            ));
+            return;
+        }
+        if stats.wal_frames > 10_000 {
+            tracing::warn!(?stats, "wal file grew beyond threshold");
+        } else {
+            tracing::debug!(?stats, "wal checkpoint completed");
+        }
     }
 
     fn handle_overlay_key(&mut self, key: KeyEvent) -> bool {
@@ -461,8 +504,8 @@ impl App {
                                 TagInputKind::Rename { original } => {
                                     self.handle_tag_editor_rename(original);
                                 }
-                                TagInputKind::Merge { source } => {
-                                    self.handle_tag_editor_merge(source);
+                                TagInputKind::Merge { sources } => {
+                                    self.handle_tag_editor_merge(sources.clone());
                                 }
                             },
                             KeyCode::Backspace => {
@@ -529,12 +572,41 @@ impl App {
                             {
                                 self.state.tag_editor_begin_merge();
                             }
+                            KeyCode::Char('M')
+                                if !key.modifiers.intersects(
+                                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                                ) =>
+                            {
+                                self.state.tag_editor_begin_marked_merge();
+                            }
                             KeyCode::Char('x')
                                 if !key.modifiers.intersects(
                                     KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
                                 ) =>
                             {
                                 self.state.tag_editor_begin_delete();
+                            }
+                            KeyCode::Char('v')
+                                if !key.modifiers.intersects(
+                                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                                ) =>
+                            {
+                                self.state.tag_editor_toggle_bulk_mark();
+                            }
+                            KeyCode::Char('V')
+                                if !key.modifiers.intersects(
+                                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                                ) =>
+                            {
+                                self.state.tag_editor_clear_bulk_marks();
+                            }
+                            KeyCode::Char(ch @ '1'..='9')
+                                if !key.modifiers.intersects(
+                                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                                ) =>
+                            {
+                                let idx = (ch as u8 - b'1') as usize;
+                                self.state.tag_editor_apply_suggestion(idx);
                             }
                             KeyCode::Char('j') | KeyCode::Down => {
                                 self.state.tag_editor_move_selection(1);
@@ -1517,7 +1589,7 @@ impl App {
         }
     }
 
-    fn handle_tag_editor_merge(&mut self, source: String) {
+    fn handle_tag_editor_merge(&mut self, sources: Vec<String>) {
         let Some(target) = self.state.tag_editor_input_value() else {
             self.state
                 .tag_editor_set_status("Enter a target tag to merge into");
@@ -1529,9 +1601,9 @@ impl App {
                 .tag_editor_set_status("Target tag cannot be empty");
             return;
         }
-        if trimmed.eq_ignore_ascii_case(&source) {
+        if sources.is_empty() {
             self.state
-                .tag_editor_set_status("Choose a different target tag");
+                .tag_editor_set_status("Select tags to merge first");
             return;
         }
         match self.storage.tag_exists(trimmed) {
@@ -1549,29 +1621,63 @@ impl App {
             Ok(true) => {}
         }
 
+        let mut seen = HashSet::new();
+        let mut unique_sources = Vec::new();
+        for source in sources {
+            let key = source.to_lowercase();
+            if seen.insert(key) && !trimmed.eq_ignore_ascii_case(&source) {
+                unique_sources.push(source);
+            }
+        }
+
+        if unique_sources.is_empty() {
+            self.state
+                .tag_editor_set_status("Nothing to merge into target tag");
+            return;
+        }
+
         let dispatcher = actions::ActionDispatcher::new(&self.storage);
-        match dispatcher.rename_tag(&source, trimmed) {
-            Ok(TagRenameOutcome::Merged {
-                from,
-                to,
-                reassigned,
-            }) => {
-                self.state.tag_editor_finish_merge(&from, &to);
-                self.refresh_after_tag_update();
-                self.state.tag_editor_set_status(format!(
-                    "Merged '{from}' into '{to}' ({reassigned} notes updated)"
-                ));
+        let mut merged_count = 0usize;
+        let mut reassigned_total = 0usize;
+
+        for source in unique_sources {
+            match dispatcher.rename_tag(&source, trimmed) {
+                Ok(TagRenameOutcome::Merged {
+                    from,
+                    to,
+                    reassigned,
+                }) => {
+                    self.state.tag_editor_finish_merge(&from, &to);
+                    merged_count += 1;
+                    reassigned_total += reassigned;
+                }
+                Ok(TagRenameOutcome::Renamed { from, to }) => {
+                    self.state.tag_editor_finish_rename(&from, &to);
+                    merged_count += 1;
+                }
+                Err(err) => {
+                    tracing::error!(?err, source, target = trimmed, "tag merge failed");
+                    self.state
+                        .tag_editor_set_status(format!("Merge failed: {err}"));
+                }
             }
-            Ok(TagRenameOutcome::Renamed { from, to }) => {
-                // This happens if the target differs only by case.
-                self.state.tag_editor_finish_rename(&from, &to);
-                self.refresh_after_tag_update();
-            }
-            Err(err) => {
-                tracing::error!(?err, source, target = trimmed, "tag merge failed");
-                self.state
-                    .tag_editor_set_status(format!("Merge failed: {err}"));
-            }
+        }
+
+        if merged_count == 0 {
+            return;
+        }
+
+        self.refresh_after_tag_update();
+        if reassigned_total > 0 {
+            self.state.tag_editor_set_status(format!(
+                "Merged {merged_count} tag{} into '{trimmed}' ({reassigned_total} notes updated)",
+                if merged_count == 1 { "" } else { "s" }
+            ));
+        } else {
+            self.state.tag_editor_set_status(format!(
+                "Merged {merged_count} tag{} into '{trimmed}'",
+                if merged_count == 1 { "" } else { "s" }
+            ));
         }
     }
 
@@ -1730,7 +1836,7 @@ mod tests {
             editor.input.clear();
             editor.input.push_str("beta");
         }
-        app.handle_tag_editor_merge("alpha".to_string());
+        app.handle_tag_editor_merge(vec!["alpha".to_string()]);
 
         let tags = app
             .storage
@@ -1745,7 +1851,7 @@ mod tests {
         let overlay = app.state.tag_editor_overlay().expect("overlay present");
         let status = overlay.status.as_deref().unwrap_or("");
         assert!(
-            status.starts_with("Merged 'alpha' into 'beta'"),
+            status.contains("Merged") && status.contains("'beta'"),
             "unexpected status: {status}"
         );
         assert_eq!(overlay.items.len(), 1);
@@ -1867,6 +1973,67 @@ mod tests {
         let overlay = app.state.tag_editor_overlay().expect("overlay present");
         assert!(overlay.items.is_empty());
 
+        Ok(())
+    }
+
+    #[test]
+    fn tag_editor_bulk_merge_multiple_tags() -> Result<()> {
+        let (_temp, mut app, note_id) = setup_app_with_note(&["alpha", "beta", "gamma"])?;
+        app.state.select_note_by_id(note_id);
+        app.state.open_tag_editor(&app.storage)?;
+        // Mark alpha
+        app.state.tag_editor_toggle_bulk_mark();
+        // Move to beta and mark
+        app.state.tag_editor_move_selection(1);
+        app.state.tag_editor_toggle_bulk_mark();
+        assert!(app.state.tag_editor_begin_marked_merge());
+        {
+            let editor = app.state.tag_editor_overlay_mut().expect("overlay open");
+            editor.input.clear();
+            editor.input.push_str("gamma");
+        }
+        app.handle_tag_editor_merge(vec!["alpha".into(), "beta".into()]);
+
+        let tags = app
+            .storage
+            .fetch_recent_notes(10)?
+            .into_iter()
+            .find(|note| note.id == note_id)
+            .expect("note present")
+            .tags;
+        assert_eq!(tags, vec!["gamma".to_string()]);
+        let overlay = app.state.tag_editor_overlay().expect("overlay present");
+        assert_eq!(
+            overlay
+                .status
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("Merged"),
+            true
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tag_editor_quick_suggestions_apply_new_tag() -> Result<()> {
+        let (_temp, mut app, note_id) = setup_app_with_note(&["alpha"])?;
+        let extra = app.storage.create_note("Other", "body", false)?;
+        app.storage.add_tag_to_note(extra, "beta")?;
+        app.storage.add_tag_to_note(extra, "delta")?;
+
+        app.state.select_note_by_id(note_id);
+        app.state.open_tag_editor(&app.storage)?;
+        assert!(app.state.tag_editor_apply_suggestion(0).is_some());
+        app.apply_tag_editor_changes();
+
+        let tags = app
+            .storage
+            .fetch_recent_notes(10)?
+            .into_iter()
+            .find(|note| note.id == note_id)
+            .expect("note present")
+            .tags;
+        assert!(tags.iter().any(|tag| tag == "beta"));
         Ok(())
     }
 }

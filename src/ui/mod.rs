@@ -4,12 +4,16 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 use time::{macros::format_description, OffsetDateTime};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
-use regex::{Regex, RegexBuilder};
+use regex::Regex;
 
 use crate::app::state::{
-    AppState, BulkTrashAction, FocusPane, OverlayState, TagEditorMode, TagInputKind,
+    AppState, BulkTrashAction, EditorState, FocusPane, NoteSummary, OverlayState, TagEditorMode,
+    TagInputKind,
 };
+use crate::highlight::build_highlight_regex;
 use crate::journaling::AutoSaveStatus;
 
 pub fn draw_app(frame: &mut Frame, state: &AppState, list_state: &mut ListState) {
@@ -242,7 +246,17 @@ pub fn draw_app(frame: &mut Frame, state: &AppState, list_state: &mut ListState)
     if state.wrap_enabled() {
         detail = detail.wrap(Wrap { trim: false });
     }
+    frame.render_widget(Clear, columns[1]);
     frame.render_widget(detail, columns[1]);
+    if let (Some(note), Some(editor)) = (state.selected(), state.editor()) {
+        if editor.note_id() == note.id {
+            if let Some((cursor_x, cursor_y)) =
+                editor_cursor_screen_position(editor, note, columns[1], state.wrap_enabled())
+            {
+                frame.set_cursor(cursor_x, cursor_y);
+            }
+        }
+    }
 
     let status = build_status_line(state);
     let status_paragraph = Paragraph::new(status).style(Style::default().fg(Color::Gray));
@@ -471,25 +485,6 @@ fn format_time_short(dt: OffsetDateTime) -> String {
         .unwrap_or_else(|_| dt.unix_timestamp().to_string())
 }
 
-fn build_highlight_regex(tokens: &[String]) -> Option<Regex> {
-    if tokens.is_empty() {
-        return None;
-    }
-    let pattern = tokens
-        .iter()
-        .filter(|token| !token.is_empty())
-        .map(|token| regex::escape(token))
-        .collect::<Vec<_>>()
-        .join("|");
-    if pattern.is_empty() {
-        return None;
-    }
-    RegexBuilder::new(&pattern)
-        .case_insensitive(true)
-        .build()
-        .ok()
-}
-
 fn highlight_line(
     text: &str,
     regex: Option<&Regex>,
@@ -537,6 +532,56 @@ fn highlight_body(body: &str, regex: Option<&Regex>, highlight_style: Style) -> 
         .collect()
 }
 
+fn editor_cursor_screen_position(
+    editor: &EditorState,
+    note: &NoteSummary,
+    area: Rect,
+    wrap_enabled: bool,
+) -> Option<(u16, u16)> {
+    let inner_width = area.width.saturating_sub(2);
+    let inner_height = area.height.saturating_sub(2);
+    if inner_width == 0 || inner_height == 0 {
+        return None;
+    }
+
+    let mut row = preview_body_offset(note);
+    let mut col = 0usize;
+    let width_limit = inner_width as usize;
+    let buffer = editor.buffer();
+    let cursor = editor.cursor().min(buffer.len());
+
+    for grapheme in buffer[..cursor].graphemes(true) {
+        if grapheme == "\n" {
+            row += 1;
+            col = 0;
+            continue;
+        }
+        let glyph_width = UnicodeWidthStr::width(grapheme);
+        if wrap_enabled && glyph_width > 0 && col + glyph_width > width_limit {
+            row += 1;
+            col = 0;
+        }
+        col += glyph_width;
+    }
+
+    let max_row = inner_height;
+    let row = row.min(max_row);
+    let limit = width_limit.max(1);
+    let col = col.min(limit - 1) as u16;
+
+    let cursor_x = area.x + 1 + col;
+    let cursor_y = area.y + 1 + row;
+    Some((cursor_x, cursor_y))
+}
+
+fn preview_body_offset(note: &NoteSummary) -> u16 {
+    let mut offset = 3; // header, meta, blank line
+    if !note.tags.is_empty() {
+        offset += 1;
+    }
+    offset
+}
+
 fn render_tag_line(
     tags: &[String],
     regex: Option<&Regex>,
@@ -555,6 +600,39 @@ fn render_tag_line(
         }
     }
     Some(Line::from(spans))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::highlight::build_highlight_regex;
+    use ratatui::style::Style;
+    use ratatui::text::Span;
+
+    fn span_texts(spans: &[Span<'static>]) -> Vec<String> {
+        spans
+            .iter()
+            .map(|span| span.content.clone().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn highlight_regex_prefers_longer_tokens_first() {
+        let regex = build_highlight_regex(&["not".into(), "note".into()]).expect("regex");
+        let spans = highlight_line("notebook", Some(&regex), Style::default(), Style::default());
+        assert_eq!(
+            span_texts(&spans),
+            vec![String::from("note"), String::from("book")]
+        );
+    }
+
+    #[test]
+    fn highlight_regex_deduplicates_case_insensitive_tokens() {
+        let regex =
+            build_highlight_regex(&["Note".into(), "note".into(), "NOTE".into()]).expect("regex");
+        let spans = highlight_line("note", Some(&regex), Style::default(), Style::default());
+        assert_eq!(span_texts(&spans), vec![String::from("note")]);
+    }
 }
 
 fn render_overlay(frame: &mut Frame, state: &AppState) {
@@ -708,7 +786,7 @@ fn render_overlay(frame: &mut Frame, state: &AppState) {
 
             let instructions = match &editor.mode {
                 TagEditorMode::Browse => {
-                    "Space toggle • a add • r rename • m merge • x delete • Enter save • Esc close"
+                    "Space toggle • v mark • a add • r rename • m merge • M merge marks • x delete • Enter save • Esc close"
                 }
                 TagEditorMode::Input(TagInputKind::Add) => {
                     "Type tag name • Enter confirm • Esc cancel"
@@ -722,14 +800,30 @@ fn render_overlay(frame: &mut Frame, state: &AppState) {
                 TagEditorMode::ConfirmDelete { .. } => "Delete tag • y confirm • n / Esc cancel",
             };
 
-            let header = Paragraph::new(vec![
+            let mut header_lines = vec![
                 Line::from(Span::styled(
                     "Tag Editor",
                     Style::default().add_modifier(Modifier::BOLD),
                 )),
                 Line::from(Span::styled(instructions, Style::default().fg(Color::Gray))),
-            ])
-            .block(
+            ];
+
+            if !editor.suggestions.is_empty() {
+                let chips = editor
+                    .suggestions
+                    .iter()
+                    .enumerate()
+                    .take(9)
+                    .map(|(idx, tag)| format!("{}:{tag}", idx + 1))
+                    .collect::<Vec<_>>()
+                    .join("  ");
+                header_lines.push(Line::from(Span::styled(
+                    format!("Suggestions (1-9): {chips}"),
+                    Style::default().fg(Color::Yellow),
+                )));
+            }
+
+            let header = Paragraph::new(header_lines).block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Cyan)),
@@ -741,6 +835,7 @@ fn render_overlay(frame: &mut Frame, state: &AppState) {
                 .iter()
                 .map(|item| {
                     let mark = if item.selected { "[x]" } else { "[ ]" };
+                    let bulk = if item.bulk_selected { "*" } else { " " };
                     let style = if item.original {
                         Style::default()
                     } else {
@@ -748,6 +843,13 @@ fn render_overlay(frame: &mut Frame, state: &AppState) {
                     };
                     ListItem::new(Line::from(vec![
                         Span::styled(mark.to_string(), style.add_modifier(Modifier::BOLD)),
+                        Span::raw(" "),
+                        Span::styled(
+                            bulk.to_string(),
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                        ),
                         Span::raw(" "),
                         Span::styled(item.name.clone(), style),
                     ]))
@@ -796,14 +898,16 @@ fn render_overlay(frame: &mut Frame, state: &AppState) {
                         Line::from(display),
                     ])
                 }
-                TagEditorMode::Input(TagInputKind::Merge { source }) => {
+                TagEditorMode::Input(TagInputKind::Merge { sources }) => {
                     let mut display = editor.input.clone();
                     display.push('▌');
+                    let label = if sources.len() == 1 {
+                        format!("Merge '{}' into tag:", sources[0])
+                    } else {
+                        format!("Merge {} tags into tag:", sources.len())
+                    };
                     Paragraph::new(vec![
-                        Line::from(Span::styled(
-                            format!("Merge '{}' into tag:", source),
-                            Style::default().fg(Color::Cyan),
-                        )),
+                        Line::from(Span::styled(label, Style::default().fg(Color::Cyan))),
                         Line::from(display),
                     ])
                 }
@@ -846,7 +950,7 @@ fn render_overlay(frame: &mut Frame, state: &AppState) {
                 Style::default().add_modifier(Modifier::BOLD),
             )));
             lines.push(Line::from(Span::styled(
-                "Enter restore • d discard • D discard all • Esc close",
+                "Enter restore • d discard • D discard all • j/k move • Esc close",
                 Style::default().fg(Color::Gray),
             )));
             lines.push(Line::from(""));
@@ -882,19 +986,32 @@ fn render_overlay(frame: &mut Frame, state: &AppState) {
                         },
                     ));
                     spans.push(Span::raw("  "));
+                    if entry.missing {
+                        spans.push(Span::styled(
+                            "[missing]",
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                        ));
+                        spans.push(Span::raw("  "));
+                    }
                     spans.push(Span::styled(
-                        &entry.saved_at,
+                        entry.saved_relative.clone(),
+                        Style::default().fg(Color::Cyan),
+                    ));
+                    spans.push(Span::raw(" ("));
+                    spans.push(Span::styled(
+                        entry.saved_at.clone(),
                         Style::default().fg(Color::Gray),
                     ));
+                    spans.push(Span::raw(")"));
                     lines.push(Line::from(spans));
 
-                    if let Some(preview) = entry.body.lines().next() {
-                        if !preview.trim().is_empty() {
-                            lines.push(Line::from(Span::styled(
-                                format!("   {}", preview.trim()),
-                                Style::default().fg(Color::DarkGray),
-                            )));
-                        }
+                    for preview in &entry.preview {
+                        lines.push(Line::from(Span::styled(
+                            format!("    {}", preview),
+                            Style::default().fg(Color::DarkGray),
+                        )));
                     }
                     lines.push(Line::from(""));
                 }

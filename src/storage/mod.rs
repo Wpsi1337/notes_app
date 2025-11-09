@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
-use regex::RegexBuilder;
+use regex::{Regex, RegexBuilder};
 use rusqlite::config::DbConfig;
 use rusqlite::{params, Connection, OptionalExtension};
 use time::OffsetDateTime;
@@ -16,6 +16,15 @@ mod schema;
 
 const TAG_DELIMITER: &str = "|:|";
 const FTS_ROW_LIMIT: usize = 200;
+const BM25_TITLE_WEIGHT: f64 = 0.2;
+const BM25_BODY_WEIGHT: f64 = 1.0;
+
+#[derive(Debug, Clone, Copy)]
+pub struct WalCheckpointStats {
+    pub busy_frames: i64,
+    pub wal_frames: i64,
+    pub checkpointed_frames: i64,
+}
 
 #[derive(Debug, Clone)]
 pub struct NoteRecord {
@@ -76,6 +85,24 @@ impl StorageHandle {
         &self.db_path
     }
 
+    pub fn run_wal_health_check(&self) -> Result<WalCheckpointStats> {
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare("PRAGMA wal_checkpoint(PASSIVE)")
+                .context("preparing wal checkpoint pragma")?;
+            let mut rows = stmt.query([]).context("executing wal checkpoint pragma")?;
+            if let Some(row) = rows.next()? {
+                Ok(WalCheckpointStats {
+                    busy_frames: row.get(0)?,
+                    wal_frames: row.get(1)?,
+                    checkpointed_frames: row.get(2)?,
+                })
+            } else {
+                bail!("wal checkpoint returned no rows");
+            }
+        })
+    }
+
     pub fn fetch_recent_notes(&self, limit: usize) -> Result<Vec<NoteRecord>> {
         self.with_connection(|conn| {
             let sql = format!(
@@ -116,6 +143,50 @@ impl StorageHandle {
                     })
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(records)
+        })
+    }
+
+    fn fetch_notes_batch(&self, limit: usize, offset: usize) -> Result<Vec<NoteRecord>> {
+        self.with_connection(|conn| {
+            let sql = format!(
+                "SELECT n.id,
+                        n.title,
+                        n.body,
+                        n.created_at,
+                        n.updated_at,
+                        n.pinned,
+                        n.archived,
+                        COALESCE(GROUP_CONCAT(t.name, '{delim}'), ''),
+                        n.deleted_at
+                 FROM notes n
+                 LEFT JOIN note_tags nt ON nt.note_id = n.id
+                 LEFT JOIN tags t ON t.id = nt.tag_id
+                 WHERE n.deleted_at IS NULL
+                   AND n.archived = 0
+                 GROUP BY n.id
+                 ORDER BY n.pinned DESC, n.updated_at DESC
+                 LIMIT ?1 OFFSET ?2",
+                delim = TAG_DELIMITER
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let records = stmt
+                .query_map(params![limit as i64, offset as i64], |row| {
+                    let tags: String = row.get(7)?;
+                    Ok(NoteRecord {
+                        id: row.get(0)?,
+                        title: row.get(1)?,
+                        body: row.get(2)?,
+                        snippet: None,
+                        created_at: row.get(3)?,
+                        updated_at: row.get(4)?,
+                        pinned: row.get::<_, i64>(5)? != 0,
+                        archived: row.get::<_, i64>(6)? != 0,
+                        tags: parse_tags(&tags),
+                        deleted_at: row.get::<_, Option<i64>>(8)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
             Ok(records)
         })
     }
@@ -164,9 +235,28 @@ impl StorageHandle {
     }
 
     pub fn search_notes(&self, query: &SearchQuery, limit: usize) -> Result<Vec<NoteRecord>> {
-        if !query.has_terms() && !query.has_filters() {
+        if !query.has_terms() && !query.has_filters() && query.regex_pattern.is_none() {
             return self.fetch_recent_notes(limit);
         }
+
+        if query.regex_pattern.is_some() && !query.has_terms() {
+            let regex = RegexBuilder::new(query.regex_pattern.as_deref().unwrap())
+                .case_insensitive(true)
+                .build()
+                .context("compiling regex search pattern")?;
+            return self.search_regex_only(query, limit, regex);
+        }
+
+        let regex = if let Some(pattern) = query.regex_pattern.as_deref() {
+            Some(
+                RegexBuilder::new(pattern)
+                    .case_insensitive(true)
+                    .build()
+                    .context("compiling regex search pattern")?,
+            )
+        } else {
+            None
+        };
 
         let fetch_limit = limit.max(FTS_ROW_LIMIT);
         let mut notes = if query.has_terms() {
@@ -176,11 +266,7 @@ impl StorageHandle {
         };
 
         apply_filters(&mut notes, query);
-        if let Some(pattern) = query.regex_pattern.as_deref() {
-            let regex = RegexBuilder::new(pattern)
-                .case_insensitive(true)
-                .build()
-                .context("compiling regex search pattern")?;
+        if let Some(regex) = &regex {
             notes.retain(|note| regex.is_match(&note.title) || regex.is_match(&note.body));
         }
         if notes.len() > limit {
@@ -193,6 +279,11 @@ impl StorageHandle {
         let Some(match_expr) = build_match_expression(query) else {
             return Ok(Vec::new());
         };
+        let title_priority_tokens = query
+            .highlight_terms()
+            .into_iter()
+            .map(|token| token.to_lowercase())
+            .collect::<Vec<_>>();
         self.with_connection(|conn| {
             let sql = format!(
                 "SELECT n.id,
@@ -209,15 +300,19 @@ impl StorageHandle {
                             WHERE nt2.note_id = n.id
                         ), '') AS tags,
                         n.deleted_at,
-                        snippet(fts_notes, 1, '', '', ' ... ', 20) AS snippet
+                        snippet(fts_notes, -1, '', '', ' ... ', 20) AS snippet
                  FROM fts_notes
                  INNER JOIN notes n ON n.id = fts_notes.rowid
                  WHERE n.deleted_at IS NULL
                    AND n.archived = 0
                    AND fts_notes MATCH ?1
-                 ORDER BY n.pinned DESC, bm25(fts_notes), n.updated_at DESC
+                 ORDER BY n.pinned DESC,
+                          bm25(fts_notes, {title_weight}, {body_weight}),
+                          n.updated_at DESC
                  LIMIT ?2",
-                delim = TAG_DELIMITER
+                delim = TAG_DELIMITER,
+                title_weight = BM25_TITLE_WEIGHT,
+                body_weight = BM25_BODY_WEIGHT
             );
             let mut stmt = conn.prepare(&sql)?;
             let rows = stmt.query_map(
@@ -245,9 +340,43 @@ impl StorageHandle {
                     })
                 },
             )?;
-            rows.collect::<Result<Vec<_>, _>>()
-                .context("querying search results")
+            let notes = rows
+                .collect::<Result<Vec<_>, _>>()
+                .context("querying search results")?;
+            if title_priority_tokens.is_empty() {
+                Ok(notes)
+            } else {
+                Ok(prioritize_title_matches(notes, &title_priority_tokens))
+            }
         })
+    }
+
+    fn search_regex_only(
+        &self,
+        query: &SearchQuery,
+        limit: usize,
+        regex: Regex,
+    ) -> Result<Vec<NoteRecord>> {
+        let mut results = Vec::new();
+        let mut offset = 0usize;
+        let batch_size = limit.max(FTS_ROW_LIMIT);
+        loop {
+            let mut batch = self.fetch_notes_batch(batch_size, offset)?;
+            if batch.is_empty() {
+                break;
+            }
+            apply_filters(&mut batch, query);
+            batch.retain(|note| regex.is_match(&note.title) || regex.is_match(&note.body));
+            results.extend(batch);
+            if results.len() >= limit {
+                break;
+            }
+            offset += batch_size;
+        }
+        if results.len() > limit {
+            results.truncate(limit);
+        }
+        Ok(results)
     }
 
     pub fn set_note_pinned(&self, note_id: i64, pinned: bool) -> Result<()> {
@@ -637,10 +766,35 @@ fn parse_tags(raw: &str) -> Vec<String> {
         .collect()
 }
 
+fn prioritize_title_matches(notes: Vec<NoteRecord>, tokens: &[String]) -> Vec<NoteRecord> {
+    let mut with_title = Vec::new();
+    let mut without_title = Vec::new();
+    for note in notes {
+        if title_contains_any(&note.title, tokens) {
+            with_title.push(note);
+        } else {
+            without_title.push(note);
+        }
+    }
+    with_title.extend(without_title);
+    with_title
+}
+
+fn title_contains_any(title: &str, tokens: &[String]) -> bool {
+    if tokens.is_empty() {
+        return false;
+    }
+    let haystack = title.to_lowercase();
+    tokens
+        .iter()
+        .any(|token| !token.is_empty() && haystack.contains(token))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{ConfigPaths, StorageOptions};
+    use crate::search::SearchQuery;
     use tempfile::TempDir;
 
     fn temp_paths(root: &TempDir) -> ConfigPaths {
@@ -766,6 +920,76 @@ mod tests {
         let trashed = storage.fetch_trashed_notes(10)?;
         assert_eq!(trashed.len(), 1);
         assert_eq!(trashed[0].id, note_id);
+        Ok(())
+    }
+
+    #[test]
+    fn search_prefers_title_matches_over_body_hits() -> anyhow::Result<()> {
+        let (_temp, storage) = init_storage()?;
+        let title_hit = storage.create_note("Nimbus Project Plan", "body text", false)?;
+        let body_hit =
+            storage.create_note("Weekly notes", "Discuss nimbus project rollout", false)?;
+
+        let mut query = SearchQuery::default();
+        query.terms = vec!["nimbus".into(), "project".into()];
+
+        let results = storage.search_notes(&query, 10)?;
+        assert!(results.len() >= 2, "expected at least two search results");
+        assert_eq!(results[0].id, title_hit, "title match should rank first");
+        assert_eq!(results[1].id, body_hit, "body-only match should follow");
+        Ok(())
+    }
+
+    #[test]
+    fn search_returns_snippet_for_title_only_matches() -> anyhow::Result<()> {
+        let (_temp, storage) = init_storage()?;
+        let _note = storage.create_note("QuasarNotebook", "plain body", false)?;
+
+        let mut query = SearchQuery::default();
+        query.terms = vec!["QuasarNotebook".into()];
+
+        let results = storage.search_notes(&query, 5)?;
+        assert!(!results.is_empty(), "expected at least one result");
+        let snippet = results[0]
+            .snippet
+            .as_deref()
+            .unwrap_or_default()
+            .to_lowercase();
+        assert!(
+            snippet.contains("quasarnotebook"),
+            "expected snippet to include the title hit, got {snippet:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn regex_only_search_scans_beyond_recent_batch() -> anyhow::Result<()> {
+        let (_temp, storage) = init_storage()?;
+        let target = storage.create_note("Very Old Regex Note", "foo123bar body", false)?;
+        for i in 0..300 {
+            let filler = storage.create_note(&format!("Pinned filler {i}"), "no match", true)?;
+            // touch the filler title so updated_at bumps to ensure it stays ahead
+            storage.rename_note_title(filler, &format!("Pinned filler {i} updated"))?;
+        }
+
+        let mut query = SearchQuery::default();
+        query.regex_pattern = Some("foo[0-9]+bar".into());
+
+        let results = storage.search_notes(&query, 5)?;
+        assert!(!results.is_empty(), "expected regex match");
+        assert_eq!(results[0].id, target);
+        Ok(())
+    }
+
+    #[test]
+    fn wal_health_check_runs() -> anyhow::Result<()> {
+        let (_temp, storage) = init_storage()?;
+        let stats = storage.run_wal_health_check()?;
+        assert!(
+            stats.busy_frames >= 0 && stats.wal_frames >= 0 && stats.checkpointed_frames >= 0,
+            "expected non-negative wal stats, got {:?}",
+            stats
+        );
         Ok(())
     }
 }

@@ -16,6 +16,8 @@
 - Upgraded search flow with a structured parser, tag/date filtering, and FTS-backed snippets in the list preview.
 - Wired the `notetui search` command into the structured search engine with snippet output and filter support.
 - Added regression tests for the CLI search pipeline (tag filters, regex) and surfaced regex/filter chips inside the TUI status bar.
+- Tuned the FTS ranking weights/snippets so title hits bubble above body-only matches and improved the highlight regex builder (length-aware, deduped) with regression tests.
+- Added CLI highlighting (TTY-aware) plus regex-only storage fallbacks that scan beyond the hot cache so pure regex queries still return snippets.
 - Built the in-app tag editor overlay (press `t`) with toggles, new-tag entry, and live persistence via the dispatcher.
 - Extended the tag editor with global rename/merge/delete workflows, new storage APIs, unit coverage for tag mutations, and scripted key-driven integration tests for rename/merge/delete flows.
 - Added inline note renaming overlay (`r`) wired to storage refresh and status messaging.
@@ -23,14 +25,16 @@
 - Delivered edit mode with autosave + crash-recovery journaling, manual save (`Ctrl-s`), and live status indicators.
 - Layered undo/redo history, word-jump navigation, and a wrap toggle into the editor with corresponding shortcuts and tests.
 - Surfaced trash retention countdowns alongside bulk restore/purge commands with confirmation overlays and automated maintenance hooks.
+- Polished the autosave recovery overlay (relative timestamps, multi-line previews, crash-safe snapshot cleanup, and clearer key hints).
+- Enhanced the tag editor with bulk merge marks, quick suggestions, and expanded integration tests.
+- Hardened autosave/storage maintenance with background snapshot pruning, periodic WAL health checks, editor cursor rendering, and documentation for the recovery/snapshot config knobs.
 
 ## Near-term milestones
 
-1. **Recovery UX**: surface autosave snapshots at launch with restore/discard workflows and clearer crash-recovery messaging.
-2. **Tag management follow-ups**: support multi-tag merges, surface quick-tag suggestions, and wire tag operations into the command palette.
-3. **Search & ranking polish**: enrich highlight spans (title/body/tag), experiment with BM25 tuning, and add fallbacks when FTS omits regex-filtered rows.
-4. **Integration & snapshot tests**: drive the TUI with scripted key events to cover quick-create, search filters, trash restore, autosave recovery, and editor flows.
-5. **Command palette & bulk actions**: surface dispatcher operations (archive, tag edits, purge) through a discoverable palette with fuzzy matching.
+1. **Tag tooling follow-ups**: expose the new bulk/suggestion flows through the command palette/CLI and add tag templates for quick-apply workflows.
+2. **Search & ranking polish**: push highlight/snippet metadata into exports/APIs, tune FTS weighting for tag relevance, and profile regex-mode scans to keep the 10k-note SLA.
+3. **Integration & snapshot tests**: drive the TUI with scripted key events to cover quick-create, search filters, trash restore, autosave recovery, and editor flows.
+4. **Command palette & bulk actions**: surface dispatcher operations (archive, tag edits, purge) through a discoverable palette with fuzzy matching.
 
 ## Longer-term targets
 

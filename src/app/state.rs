@@ -1,6 +1,6 @@
 use anyhow::Result;
 use std::collections::HashSet;
-use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::journaling::{AutoSaveStatus, RecoverySnapshot};
@@ -69,6 +69,7 @@ pub struct TagEditorItem {
     pub name: String,
     pub selected: bool,
     pub original: bool,
+    pub bulk_selected: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,7 +83,7 @@ pub enum TagEditorMode {
 pub enum TagInputKind {
     Add,
     Rename { original: String },
-    Merge { source: String },
+    Merge { sources: Vec<String> },
 }
 
 impl Default for TagEditorMode {
@@ -99,6 +100,7 @@ pub struct TagEditorOverlay {
     pub mode: TagEditorMode,
     pub input: String,
     pub status: Option<String>,
+    pub suggestions: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,7 +119,9 @@ pub struct RecoveryEntry {
     pub note_id: i64,
     pub title: String,
     pub saved_at: String,
+    pub saved_relative: String,
     pub body: String,
+    pub preview: Vec<String>,
     pub missing: bool,
 }
 
@@ -868,6 +872,7 @@ impl AppState {
                 name: tag.clone(),
                 selected,
                 original: selected,
+                bulk_selected: false,
             });
             seen.insert(tag.clone());
         }
@@ -877,10 +882,18 @@ impl AppState {
                     name: tag.clone(),
                     selected: true,
                     original: true,
+                    bulk_selected: false,
                 });
             }
         }
         items.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        let suggestions = tags
+            .iter()
+            .filter(|tag| !note_tags.contains(*tag))
+            .take(5)
+            .cloned()
+            .collect();
+
         let overlay = TagEditorOverlay {
             note_id: note.id,
             items,
@@ -888,6 +901,7 @@ impl AppState {
             mode: TagEditorMode::default(),
             input: String::new(),
             status: None,
+            suggestions,
         };
         self.overlay = Some(OverlayState::TagEditor(overlay));
         Ok(())
@@ -905,6 +919,7 @@ impl AppState {
         for snapshot in snapshots {
             let note_id = snapshot.note_id;
             let saved_at = format_datetime(snapshot.saved_at);
+            let saved_relative = format_relative_time(snapshot.saved_at);
             let body = snapshot.body.clone();
             let record = storage.fetch_note_by_id(note_id)?;
             let (title, missing) = match record {
@@ -915,7 +930,9 @@ impl AppState {
                 note_id,
                 title,
                 saved_at,
+                saved_relative,
                 body,
+                preview: build_recovery_preview(&snapshot.body),
                 missing,
             });
         }
@@ -1158,7 +1175,7 @@ impl AppState {
         if let Some(editor) = self.tag_editor_overlay_mut() {
             if let Some(item) = editor.items.get(editor.selected_index) {
                 editor.mode = TagEditorMode::Input(TagInputKind::Merge {
-                    source: item.name.clone(),
+                    sources: vec![item.name.clone()],
                 });
                 editor.input.clear();
                 editor.status = Some(format!(
@@ -1167,6 +1184,103 @@ impl AppState {
                 ));
             }
         }
+    }
+
+    pub fn tag_editor_begin_marked_merge(&mut self) -> bool {
+        let Some(editor) = self.tag_editor_overlay_mut() else {
+            return false;
+        };
+        let sources: Vec<String> = editor
+            .items
+            .iter()
+            .filter(|item| item.bulk_selected)
+            .map(|item| item.name.clone())
+            .collect();
+        if sources.len() < 2 {
+            editor.status = Some("Mark at least two tags with 'v' before using bulk merge".into());
+            return false;
+        }
+        editor.mode = TagEditorMode::Input(TagInputKind::Merge { sources });
+        editor.input.clear();
+        editor.status = Some("Merge marked tags into existing tag: type target name".into());
+        true
+    }
+
+    pub fn tag_editor_toggle_bulk_mark(&mut self) {
+        if let Some(editor) = self.tag_editor_overlay_mut() {
+            if let Some(item) = editor.items.get_mut(editor.selected_index) {
+                item.bulk_selected = !item.bulk_selected;
+                if item.bulk_selected {
+                    editor
+                        .status
+                        .replace(format!("Marked '{}' for bulk actions", item.name));
+                } else {
+                    editor.status.replace(format!("Unmarked '{}'", item.name));
+                }
+            }
+        }
+    }
+
+    pub fn tag_editor_clear_bulk_marks(&mut self) {
+        if let Some(editor) = self.tag_editor_overlay_mut() {
+            let mut cleared = 0;
+            for item in &mut editor.items {
+                if item.bulk_selected {
+                    item.bulk_selected = false;
+                    cleared += 1;
+                }
+            }
+            if cleared > 0 {
+                editor.status.replace(format!(
+                    "Cleared {cleared} bulk mark{}",
+                    if cleared == 1 { "" } else { "s" }
+                ));
+            } else {
+                editor.status.replace("No bulk marks to clear".into());
+            }
+        }
+    }
+
+    pub fn tag_editor_apply_suggestion(&mut self, index: usize) -> Option<String> {
+        let editor = self.tag_editor_overlay_mut()?;
+        if index >= editor.suggestions.len() {
+            editor.status.replace("No suggestion in that slot".into());
+            return None;
+        }
+        let tag = editor.suggestions.remove(index);
+        let mut selected_index = None;
+        if let Some((idx, item)) = editor
+            .items
+            .iter_mut()
+            .enumerate()
+            .find(|(_, item)| item.name.eq_ignore_ascii_case(&tag))
+        {
+            item.selected = true;
+            item.bulk_selected = false;
+            selected_index = Some(idx);
+        } else {
+            editor.items.push(TagEditorItem {
+                name: tag.clone(),
+                selected: true,
+                original: false,
+                bulk_selected: false,
+            });
+            editor
+                .items
+                .sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            if let Some(idx) = editor
+                .items
+                .iter()
+                .position(|item| item.name.eq_ignore_ascii_case(&tag))
+            {
+                selected_index = Some(idx);
+            }
+        }
+        if let Some(idx) = selected_index {
+            editor.selected_index = idx;
+        }
+        editor.status = Some(format!("Queued tag '{tag}' (press Enter to save)"));
+        Some(tag)
     }
 
     pub fn tag_editor_begin_delete(&mut self) {
@@ -1225,6 +1339,7 @@ impl AppState {
                     name: normalized.clone(),
                     selected: true,
                     original: false,
+                    bulk_selected: false,
                 });
                 editor
                     .items
@@ -1276,9 +1391,11 @@ impl AppState {
                 if item.name == from {
                     let was_selected = item.selected;
                     let was_original = item.original;
+                    let was_bulk = item.bulk_selected;
                     item.name = to.to_string();
                     item.selected = was_selected;
                     item.original = was_original;
+                    item.bulk_selected = was_bulk;
                     break;
                 }
             }
@@ -1323,11 +1440,13 @@ impl AppState {
                 if carried_original {
                     target.original = true;
                 }
+                target.bulk_selected = false;
             } else {
                 editor.items.push(TagEditorItem {
                     name: to.to_string(),
                     selected: carried_selected,
                     original: carried_original,
+                    bulk_selected: false,
                 });
             }
 
@@ -1347,6 +1466,9 @@ impl AppState {
             editor.mode = TagEditorMode::Browse;
             editor.input.clear();
             editor.status = Some(format!("Merged '{from}' into '{to}'"));
+            for item in &mut editor.items {
+                item.bulk_selected = false;
+            }
         }
     }
 
@@ -1649,6 +1771,31 @@ fn format_datetime(dt: OffsetDateTime) -> String {
         .unwrap_or_else(|_| dt.unix_timestamp().to_string())
 }
 
+fn format_relative_time(dt: OffsetDateTime) -> String {
+    let now = OffsetDateTime::now_utc();
+    let diff = now - dt;
+    if diff.is_negative() {
+        return "just now".to_string();
+    }
+    if diff < Duration::seconds(45) {
+        return "just now".to_string();
+    }
+    if diff < Duration::minutes(90) {
+        let mins = diff.whole_minutes().max(1);
+        return format!("{mins}m ago");
+    }
+    if diff < Duration::hours(36) {
+        let hours = diff.whole_hours().max(1);
+        return format!("{hours}h ago");
+    }
+    if diff < Duration::days(10) {
+        let days = diff.whole_days().max(1);
+        return format!("{days}d ago");
+    }
+    dt.format(&Rfc3339)
+        .unwrap_or_else(|_| dt.unix_timestamp().to_string())
+}
+
 fn format_timestamp(epoch: i64) -> String {
     OffsetDateTime::from_unix_timestamp(epoch)
         .map(|dt| dt.format(&Rfc3339).unwrap_or_else(|_| epoch.to_string()))
@@ -1681,6 +1828,30 @@ fn build_preview(body: &str, preview_lines: usize) -> String {
         } else {
             preview.push('…');
         }
+    }
+    preview
+}
+
+fn build_recovery_preview(body: &str) -> Vec<String> {
+    const MAX_LINES: usize = 4;
+    const MAX_COLS: usize = 80;
+    let mut preview = Vec::new();
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let mut snippet = trimmed.chars().take(MAX_COLS).collect::<String>();
+        if trimmed.chars().count() > MAX_COLS {
+            snippet.push('…');
+        }
+        preview.push(snippet);
+        if preview.len() == MAX_LINES {
+            break;
+        }
+    }
+    if preview.is_empty() {
+        preview.push("(empty draft)".to_string());
     }
     preview
 }

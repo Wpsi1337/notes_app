@@ -99,7 +99,7 @@ Triggers keep `updated_at` correct, refresh `fts_notes`, and cascade tag deletio
    - `Store`: shared storage facade that batches DB interactions onto a dedicated thread to keep the UI responsive.
 3. **Rendering**: `ui::*` renders the state to `ratatui` frames. Virtualised list rendering only lays out visible rows, honoring search highlights and filter badges.
 4. **Input handling**: `crossterm` events feed into a keybinding resolver that maps keys → actions based on the active profile (vim/emacs/custom). Actions mutate state and queue storage operations asynchronously. Results feed back into the state via channels.
-5. **Auto-save & journaling**: editor component debounces edits into a journal file under `~/.cache/notetui/` so that forced exits recover unsaved work. Saving flushes both DB and journal snapshot.
+5. **Auto-save & journaling**: editor component debounces edits into a journal file under `~/.cache/notetui/` so that forced exits recover unsaved work. Saving flushes both DB and journal snapshot. A retention policy (`auto_save.snapshot_retention_hours`) governs how long crash-recovery files stay on disk; maintenance sweeps drop expired/partial snapshots before presenting the recovery overlay, and a background timer keeps pruning snapshots even if the recovery UI is never opened. The app also checkpoints SQLite’s WAL file on a timer so permission issues or wedged writers surface as early warnings in the status bar.
 
 ## Search pipeline
 

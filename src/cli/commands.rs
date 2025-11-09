@@ -1,14 +1,17 @@
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::io::{self, Read};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
+use regex::{Regex, RegexBuilder};
 use rusqlite::{params, Connection, OptionalExtension};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::app::App;
 use crate::config::AppConfig;
+use crate::highlight::build_highlight_regex;
 use crate::search::{parse_query, regex_pattern_from_input};
 use crate::storage::{NoteRecord, StorageHandle, TagRenameOutcome};
 
@@ -86,8 +89,9 @@ pub struct TagRenameArgs {
 
 #[derive(Args, Debug, Clone)]
 pub struct TagMergeArgs {
-    /// Source tag that will be merged
-    pub from: String,
+    /// Source tag(s) that will be merged (specify one or more)
+    #[arg(required = true, value_name = "SOURCE_TAG", num_args = 1..)]
+    pub from: Vec<String>,
     /// Target tag that must already exist
     pub into: String,
 }
@@ -167,10 +171,29 @@ fn run_search(storage: &StorageHandle, args: &SearchArgs) -> Result<String> {
     let results = storage
         .search_notes(&storage_query, args.limit)
         .context("executing search")?;
-    Ok(format_search_results(&results))
+    let highlight_regex = if args.regex {
+        query.regex_pattern.as_deref().and_then(|pattern| {
+            RegexBuilder::new(pattern)
+                .case_insensitive(true)
+                .build()
+                .ok()
+        })
+    } else {
+        build_highlight_regex(&query.highlight_terms())
+    };
+    let colorize = atty::is(atty::Stream::Stdout);
+    Ok(format_search_results(
+        &results,
+        highlight_regex.as_ref(),
+        colorize,
+    ))
 }
 
-fn format_search_results(notes: &[NoteRecord]) -> String {
+fn format_search_results(
+    notes: &[NoteRecord],
+    highlight_regex: Option<&Regex>,
+    colorize: bool,
+) -> String {
     if notes.is_empty() {
         return "No matches found.\n".to_string();
     }
@@ -193,6 +216,7 @@ fn format_search_results(notes: &[NoteRecord]) -> String {
             let _ = writeln!(&mut out, "    tags    {}", format_tags(&note.tags));
         }
         if let Some(snippet) = build_snippet(note, 2) {
+            let snippet = highlight_cli_text(&snippet, highlight_regex, colorize);
             let _ = writeln!(&mut out, "    {snippet}");
         }
         out.push('\n');
@@ -355,9 +379,8 @@ fn tag_rename(storage: &StorageHandle, args: TagRenameArgs) -> Result<()> {
 }
 
 fn tag_merge(storage: &StorageHandle, args: TagMergeArgs) -> Result<()> {
-    let from = args.from.trim();
-    if from.is_empty() {
-        bail!("source tag cannot be empty");
+    if args.from.is_empty() {
+        bail!("provide at least one source tag");
     }
     let mut into = args.into.trim().to_string();
     if into.is_empty() {
@@ -365,9 +388,6 @@ fn tag_merge(storage: &StorageHandle, args: TagMergeArgs) -> Result<()> {
     }
     if into.len() > 64 {
         into.truncate(64);
-    }
-    if from.eq_ignore_ascii_case(&into) {
-        bail!("source and target tags must differ");
     }
 
     if !storage
@@ -377,24 +397,49 @@ fn tag_merge(storage: &StorageHandle, args: TagMergeArgs) -> Result<()> {
         bail!("target tag '{into}' does not exist");
     }
 
-    let outcome = storage
-        .rename_tag(from, &into)
-        .with_context(|| format!("merging tag '{from}' into '{into}'"))?;
-    match outcome {
-        TagRenameOutcome::Merged {
-            from,
-            to,
-            reassigned,
-        } => {
-            println!(
-                "Merged tag '{from}' into '{to}' (relinked {} note{})",
+    let mut seen = HashSet::new();
+    let mut merged = 0usize;
+    let mut reassigned_total = 0usize;
+
+    for source in args.from {
+        let trimmed = source.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case(&into) {
+            continue;
+        }
+        if !seen.insert(trimmed.to_lowercase()) {
+            continue;
+        }
+        match storage
+            .rename_tag(trimmed, &into)
+            .with_context(|| format!("merging tag '{trimmed}' into '{into}'"))?
+        {
+            TagRenameOutcome::Merged {
+                from,
+                to,
                 reassigned,
-                if reassigned == 1 { "" } else { "s" }
-            );
+            } => {
+                println!(
+                    "Merged tag '{from}' into '{to}' (relinked {} note{})",
+                    reassigned,
+                    if reassigned == 1 { "" } else { "s" }
+                );
+                merged += 1;
+                reassigned_total += reassigned;
+            }
+            TagRenameOutcome::Renamed { from, to } => {
+                println!("Renamed tag '{from}' to '{to}' (target differed only by case)");
+                merged += 1;
+            }
         }
-        TagRenameOutcome::Renamed { from, to } => {
-            println!("Renamed tag '{from}' to '{to}' (target was missing, renamed instead)");
-        }
+    }
+
+    if merged == 0 {
+        println!("No source tags merged into '{into}'");
+    } else if merged > 1 {
+        println!(
+            "Finished merging {merged} tags into '{into}' (touched {reassigned_total} note{})",
+            if reassigned_total == 1 { "" } else { "s" }
+        );
     }
     Ok(())
 }
@@ -469,11 +514,34 @@ fn format_timestamp(epoch: i64) -> String {
         .unwrap_or_else(|_| epoch.to_string())
 }
 
+fn highlight_cli_text(text: &str, regex: Option<&Regex>, colorize: bool) -> String {
+    let Some(re) = regex else {
+        return text.to_string();
+    };
+    if !colorize {
+        return text.to_string();
+    }
+    let mut highlighted = String::with_capacity(text.len());
+    let mut last = 0;
+    for mat in re.find_iter(text) {
+        if mat.start() > last {
+            highlighted.push_str(&text[last..mat.start()]);
+        }
+        highlighted.push_str("\x1b[1m");
+        highlighted.push_str(mat.as_str());
+        highlighted.push_str("\x1b[0m");
+        last = mat.end();
+    }
+    highlighted.push_str(&text[last..]);
+    highlighted
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{ConfigPaths, StorageOptions};
     use crate::storage;
+    use regex::Regex;
     use tempfile::TempDir;
 
     type TestResult<T = ()> = Result<T>;
@@ -522,6 +590,19 @@ mod tests {
     }
 
     #[test]
+    fn highlight_cli_text_wraps_matches_when_color_enabled() {
+        let regex = Regex::new("note").expect("regex");
+        let highlighted = super::highlight_cli_text("note body", Some(&regex), true);
+        assert!(
+            highlighted.contains("\u{1b}[1mnote\u{1b}[0m"),
+            "expected ANSI-wrapped highlight, got {highlighted:?}"
+        );
+
+        let no_color = super::highlight_cli_text("note body", Some(&regex), false);
+        assert_eq!(no_color, "note body");
+    }
+
+    #[test]
     fn cli_tag_rename_updates_tag() -> TestResult {
         let (_temp_dir, storage) = setup_storage()?;
         let note_id = storage.create_note("Rename target", "body", false)?;
@@ -557,7 +638,7 @@ mod tests {
         tag_merge(
             &storage,
             TagMergeArgs {
-                from: "alpha".into(),
+                from: vec!["alpha".into()],
                 into: "beta".into(),
             },
         )?;
@@ -581,6 +662,32 @@ mod tests {
             .clone();
         assert!(beta_tags.contains(&"beta".to_string()));
         assert!(!beta_tags.iter().any(|tag| tag == "alpha"));
+
+        // Merge multiple tags into a new destination.
+        storage.add_tag_to_note(alpha_note, "gamma")?;
+        storage.add_tag_to_note(beta_note, "delta")?;
+        storage
+            .add_tag_to_note(beta_note, "epsilon")
+            .expect("add epsilon");
+
+        tag_merge(
+            &storage,
+            TagMergeArgs {
+                from: vec!["gamma".into(), "delta".into(), "gamma".into()],
+                into: "epsilon".into(),
+            },
+        )?;
+
+        let tags_after = storage.fetch_recent_notes(10)?;
+        let mine = tags_after
+            .iter()
+            .find(|note| note.id == alpha_note)
+            .expect("alpha note present after bulk merge")
+            .tags
+            .clone();
+        assert!(mine.contains(&"epsilon".to_string()));
+        assert!(!mine.iter().any(|tag| tag == "gamma"));
+        assert!(!mine.iter().any(|tag| tag == "delta"));
 
         Ok(())
     }

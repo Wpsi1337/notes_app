@@ -187,6 +187,8 @@ pub struct AutoSaveConfig {
     pub debounce_ms: u64,
     pub enabled: bool,
     pub crash_recovery: bool,
+    /// Retain crash-recovery snapshots for this many hours (0 = keep indefinitely)
+    pub snapshot_retention_hours: u64,
 }
 
 impl Default for AutoSaveConfig {
@@ -195,6 +197,7 @@ impl Default for AutoSaveConfig {
             debounce_ms: 800,
             enabled: true,
             crash_recovery: true,
+            snapshot_retention_hours: 24 * 7,
         }
     }
 }
@@ -202,6 +205,14 @@ impl Default for AutoSaveConfig {
 impl AutoSaveConfig {
     pub fn debounce_duration(&self) -> Duration {
         Duration::milliseconds(self.debounce_ms as i64)
+    }
+
+    pub fn snapshot_retention(&self) -> Option<Duration> {
+        if self.snapshot_retention_hours == 0 {
+            None
+        } else {
+            Some(Duration::hours(self.snapshot_retention_hours as i64))
+        }
     }
 }
 
